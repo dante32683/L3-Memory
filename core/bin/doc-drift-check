@@ -524,9 +524,9 @@ def check_stale_related_links() -> list[Finding]:
 # (calendar/canvas/drive/gmail/gtasks/office) — which excludes the generic-word
 # namespaces (save_/search_/remote_/server_) entirely.
 #
-# NOTE for whoever extends this: a SECOND memory system (this agent's own memory
-# files under ~/.claude/projects/-home-ubuntu/memory/) watches the same tool
-# names but lives outside $HERMES_HOME — sweep it by hand on any tool rename.
+# NOTE for whoever extends this: if your agent has a SEPARATE memory system
+# (e.g. a coding assistant's own project memory) that also watches tool names,
+# it likely lives outside $HERMES_HOME — sweep it by hand on any tool rename.
 
 # The destructive-gate enforcement files whose quoted tool literals must name
 # only live tools (a stale key here = a destructive action silently ungated).

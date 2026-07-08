@@ -3,14 +3,14 @@
 
 When Hermes receives a file (e.g. a textbook on Telegram), stock caches it to a
 local path and sets event.media_urls. This router decides WHICH topic the file
-belongs to (mimo — low-frequency, accuracy-sensitive) and files it:
+belongs to (aux-model call — low-frequency, accuracy-sensitive) and files it:
 
   * Every topic is a folder: knowledge/<slug>/<slug>.md + knowledge/<slug>/files/.
     A brand-new topic is created directly in that shape; an existing topic's
     files/ just gains the new attachment. No flat form, no promotion step.
 
-mimo only makes the routing decision (slug + new/existing + title/aliases). All
-file operations are deterministic Python — reliable regardless of the model.
+The aux model only makes the routing decision (slug + new/existing + title/aliases).
+All file operations are deterministic Python — reliable regardless of the model.
 
 Usage:
   artifact-route --file /path/to/textbook.pdf --caption "physics 40 textbook"

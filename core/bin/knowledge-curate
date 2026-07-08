@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""knowledge-curate — autonomous INBOX → knowledge curation (v3 §4, mimo-driven).
+"""knowledge-curate — autonomous INBOX → knowledge curation (v3 §4, aux-model-driven).
 
 The janitor that makes the knowledge base self-maintaining. Run nightly (cron).
-mimo does ALL the judgment; the script only does safe file I/O. Steps:
+The aux model does ALL the judgment; the script only does safe file I/O. Steps:
 
   1. Read append-only INBOX.md captured lines.
-  2. ROUTE (one mimo call): each line -> merge into an existing topic, create a
+  2. ROUTE (one aux-model call): each line -> merge into an existing topic, create a
      NEW topic (with slug + aliases), or drop as noise.
-  3. INTEGRATE (one mimo call per touched existing topic): rewrite the file body
+  3. INTEGRATE (one aux-model call per touched existing topic): rewrite the file body
      deduped, with superseded facts dropped, kept UNDER budget. This folds
      dedupe + staleness-prune + cap-and-compress into a single automatic pass —
      so knowledge files can never grow without bound.
@@ -649,7 +649,7 @@ def main() -> int:
     skill_names = {s["name"] for s in skills_idx}
     decisions = _route_all(lines, topics, skills_idx)
     if not isinstance(decisions, list):
-        print("ABORT: routing failed (mimo); INBOX preserved.", file=sys.stderr)
+        print("ABORT: routing failed (aux model); INBOX preserved.", file=sys.stderr)
         return 1
 
     existing = {t["slug"] for t in topics}
