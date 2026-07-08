@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""hermes-add — the mechanical budget gate (v3 plan §6.1).
+
+Adding machinery to PRODUCTION goes through here. It REFUSES the addition if it
+would exceed the budget, until you remove something. A budget the system enforces
+is real; a budget you honor is decoration.
+
+Budgets (v3 §6):  crons<=6  hooks<=4  plugins<=6  skills<=8
+
+Usage:
+  hermes-add check                 # show current counts vs budget
+  hermes-add can <kind>            # exit 0 if there's room for one more <kind>, else 1
+  <kind> in: cron hook plugin skill
+
+This gate does not itself install anything — it is the guard you (or an install
+script) MUST consult first. Enforced by convention + the Phase-2+ install wrappers
+that call `hermes-add can <kind>` and abort on non-zero.
+"""
+from __future__ import annotations
+import json, os, sys
+from pathlib import Path
+
+HOME = Path(os.environ.get("L3_HOME", os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))))
+# skill budget counts only CUSTOM (added) skill categories, not the upstream
+# stock set recorded in skills/.stock-baseline.json. 8 was too tight once you
+# account for the ~16 stock categories; 12 custom is the meaningful headroom.
+BUDGET = {"cron": 6, "hook": 4, "plugin": 6, "skill": 12}
+
+
+def _load_yaml(p):
+    try:
+        import yaml; return yaml.safe_load(p.read_text()) or {}
+    except Exception:
+        return {}
+
+
+def count(kind: str) -> int:
+    if kind == "plugin":
+        d = HOME / "plugins"
+        return len([x for x in d.iterdir() if (x / "plugin.yaml").is_file()]) if d.is_dir() else 0
+    if kind == "skill":
+        d = HOME / "skills"
+        if not d.is_dir():
+            return 0
+        current = {x.name for x in d.glob("*") if x.is_dir() and not x.name.startswith(".")}
+        stock = set()
+        base = d / ".stock-baseline.json"
+        if base.is_file():
+            try:
+                stock = set(json.loads(base.read_text()).get("stock", []))
+            except Exception:
+                stock = set()
+        return len(current - stock)   # only custom additions count against budget
+    if kind == "cron":
+        jf = HOME / "cron" / "jobs.json"
+        if jf.is_file():
+            data = json.loads(jf.read_text())
+            jobs = data if isinstance(data, list) else data.get("jobs", [])
+            return len(jobs)
+        return 0
+    if kind == "hook":
+        cfg = _load_yaml(HOME / "config.yaml")
+        hooks = cfg.get("hooks", {}) if isinstance(cfg, dict) else {}
+        # count distinct registered hook scripts across all events
+        seen = set()
+        for v in (hooks.values() if isinstance(hooks, dict) else []):
+            for entry in (v if isinstance(v, list) else [v]):
+                if isinstance(entry, str):
+                    seen.add(entry)
+                elif isinstance(entry, dict):
+                    seen.add(entry.get("script") or entry.get("path") or json.dumps(entry))
+        return len(seen)
+    raise SystemExit(f"unknown kind: {kind}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__); raise SystemExit(2)
+    cmd = sys.argv[1]
+    if cmd == "check":
+        print(f"{'KIND':<8} {'NOW':>3} / {'MAX':<3}  STATUS")
+        ok = True
+        for k, mx in BUDGET.items():
+            n = count(k)
+            status = "OK" if n < mx else ("FULL" if n == mx else "OVER")
+            if n >= mx: ok = False
+            print(f"{k:<8} {n:>3} / {mx:<3}  {status}")
+        raise SystemExit(0 if ok else 1)
+    if cmd == "can":
+        kind = sys.argv[2]
+        n, mx = count(kind), BUDGET[kind]
+        if n < mx:
+            print(f"OK: room for one more {kind} ({n}/{mx})"); raise SystemExit(0)
+        print(f"REFUSED: {kind} budget full ({n}/{mx}). Remove one before adding — "
+              f"see migration-plan-v3.md §6. This refusal is the feature.")
+        raise SystemExit(1)
+    print(__doc__); raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()

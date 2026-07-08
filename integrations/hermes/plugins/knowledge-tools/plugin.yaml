@@ -1,0 +1,9 @@
+name: knowledge-tools
+version: 0.1.0
+description: "Read/search + explicit filing for the personal L3 knowledge base AND skill library. save_to_knowledge: user-invoked filing of an attached doc ('save this to knowledge') — the agent picks the topic folder and files it (never auto-saves). search_knowledge: two-step recall over knowledge + skills — mode='search' returns candidates (slug, kind, summary, size, heading outline; tiny files inlined) via the same identity index in recall mode plus body/substring scoring; mode='outline'/'section'/'full' do granular reads of one slug so the agent pulls exactly the section it needs instead of dumping whole files."
+kind: standalone
+platforms:
+  - linux
+provides_tools:
+  - save_to_knowledge
+  - search_knowledge

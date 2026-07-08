@@ -1,0 +1,17 @@
+# Reference only — install-hermes.py writes these hook entries into your
+# config.yaml automatically, resolving $HERMES_HOME for your machine. This
+# file just shows the shape of what gets added, using ~/.hermes as example.
+hooks:
+  on_session_end:
+    - command: python3 ~/.hermes/hooks/inbox-capture.py
+      timeout: 10
+    - command: python3 ~/.hermes/bin/discovery-extract
+      timeout: 10
+  on_session_finalize:
+    - command: python3 ~/.hermes/hooks/inbox-capture.py
+      timeout: 10
+    - command: python3 ~/.hermes/bin/discovery-extract
+      timeout: 10
+  pre_llm_call:
+    - command: python3 ~/.hermes/hooks/knowledge-inject.py
+      timeout: 10

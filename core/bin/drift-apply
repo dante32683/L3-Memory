@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+"""drift-apply — the deterministic APPLIER half of the doc-drift loop (pipeline Phase 5).
+
+Companion to `bin/doc-drift-check` (the REVIEWER). The two are split on purpose so
+an LLM is NEVER in the write path for an auto-applied change:
+
+  * doc-drift-check classifies findings into FIXABLE (confidence HIGH — carries an
+    exact, already-computed `- old / + new` surgical diff) vs UNSURE (needs
+    judgement; no diff).
+  * FIXABLE  → applied here DETERMINISTICALLY with pure stdlib, NO model call. The
+    fix is a literal line swap (or a `## Related` bullet removal via related_links),
+    so the destructive-LLM-rewrite risk (the MEMORY.md near-miss) structurally can
+    not occur on the auto path. Every swap is GUARDED: if the target line no longer
+    matches `old` (the doc changed since the check ran), it is skipped as stale and
+    re-surfaced, never force-applied. Each edited file is archived first.
+  * UNSURE  → proposal-only: a short, deterministic escalation message (built from
+    the Finding's own fields — again no model) is emitted for Telegram, with a
+    3-day re-escalation cooldown tracked in `knowledge/.system/drift-pending.json`.
+  * DENYLIST (SOUL.md, MEMORY.md, PATCHES.md) → these high-blast-radius self-docs
+    are NEVER auto-edited even for a FIXABLE swap; they always escalate as proposals.
+
+Findings are recomputed fresh from doc-drift-check's CHECKS (structured Finding
+objects), not parsed back out of the markdown report — no brittle re-parsing.
+
+Usage: `drift-apply` (apply + emit digest) or `drift-apply --dry-run` (report only,
+no writes). Silent stdout when nothing was applied and nothing new to escalate.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from importlib.machinery import SourceFileLoader
+
+HERMES_HOME = Path(os.environ.get("L3_HOME", os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))))
+BIN = HERMES_HOME / "bin"
+KNOW = HERMES_HOME / "knowledge"
+ARCHIVE = KNOW / ".archive"
+PENDING = KNOW / ".system" / "drift-pending.json"
+
+# High-blast-radius self-docs: never auto-edit, always escalate (2026-07-02).
+DENYLIST = {"SOUL.md", "MEMORY.md", "PATCHES.md"}
+COOLDOWN_DAYS = 3
+
+sys.path.insert(0, str(BIN))
+import related_links  # noqa: E402
+import knowledge_topics as kt  # noqa: E402
+_ddc = SourceFileLoader("doc_drift_check", str(BIN / "doc-drift-check")).load_module()
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _fingerprint(f) -> str:
+    return hashlib.sha1(f"{f.check}|{f.doc}|{f.claim}|{f.actual}".encode()).hexdigest()[:16]
+
+
+def _resolve(doc: str) -> tuple[Path, int | None]:
+    """'relpath:line' → (absolute path, line number or None)."""
+    m = re.match(r"^(.*?):(\d+)$", doc)
+    if m:
+        return HERMES_HOME / m.group(1), int(m.group(2))
+    return HERMES_HOME / doc, None
+
+
+def _parse_swap(proposed_fix: str) -> tuple[str, str] | None:
+    """A `_swap_fix` diff is exactly two lines: '- <old>' then '+ <new>' (stripped)."""
+    old = new = None
+    for ln in proposed_fix.splitlines():
+        if ln.startswith("- ") and old is None:
+            old = ln[2:]
+        elif ln.startswith("+ ") and new is None:
+            new = ln[2:]
+    if old is None or new is None:
+        return None
+    return old, new
+
+
+def _apply_swap(path: Path, lineno: int | None, old: str, new: str) -> bool:
+    """Replace the line whose stripped text == old with new (indentation preserved).
+    Prefer the reported line number; fall back to a UNIQUE match elsewhere. Returns
+    False (stale, skip) if the line can't be located unambiguously."""
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+    def swap_at(i: int) -> bool:
+        raw = lines[i]
+        indent = raw[: len(raw) - len(raw.lstrip())]
+        eol = "\n" if raw.endswith("\n") else ""
+        lines[i] = indent + new + eol
+        return True
+
+    if lineno is not None and 1 <= lineno <= len(lines) and lines[lineno - 1].strip() == old:
+        swap_at(lineno - 1)
+    else:
+        hits = [i for i, l in enumerate(lines) if l.strip() == old]
+        if len(hits) != 1:
+            return False
+        swap_at(hits[0])
+    path.write_text("".join(lines), encoding="utf-8")
+    return True
+
+
+def _apply_related_removal(path: Path, finding) -> bool:
+    """FIXABLE stale ## Related link → drop the dangling bullet deterministically."""
+    m = re.search(r"\[\[([^\]|]+?)(?:\|[^\]]+)?\]\]", finding.claim) or \
+        re.search(r"\[\[([^\]|]+?)(?:\|[^\]]+)?\]\]", finding.title)
+    if not m:
+        return False
+    text = path.read_text(encoding="utf-8")
+    new_text, changed = related_links.remove_link(text, m.group(1).strip())
+    if changed:
+        path.write_text(new_text, encoding="utf-8")
+    return changed
+
+
+def _archive(path: Path, stamp: str) -> None:
+    ARCHIVE.mkdir(exist_ok=True)
+    shutil.copy2(path, ARCHIVE / f"{path.stem}.{stamp}.driftapply.md")
+
+
+def _escalation_text(f) -> str:
+    """Deterministic, chat-friendly escalation built from the Finding's own fields —
+    no model call. Names the doc, the gap, and (if any) the suggested fix."""
+    lines = [f"• *{f.title}*  (`{f.doc}`)",
+             f"    claim: {f.claim}",
+             f"    actual: {f.actual}"]
+    if f.why_unsure:
+        lines.append(f"    why unsure: {f.why_unsure}")
+    if f.proposed_fix:
+        lines.append(f"    suggested: {f.proposed_fix.replace(chr(10), '  //  ')}")
+    return "\n".join(lines)
+
+
+def _load_pending() -> dict:
+    try:
+        return json.loads(PENDING.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_pending(d: dict) -> None:
+    PENDING.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PENDING.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    tmp.replace(PENDING)
+
+
+# `__dismissed__` is a reserved key in the pending file: {fingerprint: delta} of
+# findings the user explicitly told `/drift dismiss` to stop nagging about. A
+# dismissal only holds while the finding is UNCHANGED — if its `delta` moves, the
+# finding re-surfaces (same philosophy as the cooldown). Step 5 of the plan.
+_DISMISS_KEY = "__dismissed__"
+
+
+def collect_findings() -> list:
+    """Recompute every Finding fresh from doc-drift-check's CHECKS (structured
+    objects, never re-parsed from the markdown report). Shared by the nightly
+    applier and the /drift command so both see the identical set."""
+    findings: list = []
+    for check in _ddc.CHECKS:
+        try:
+            findings.extend(check() or [])
+        except Exception as e:
+            print(f"⚠️ drift-apply: check {getattr(check,'__name__','?')} raised {type(e).__name__}: {e}",
+                  file=sys.stderr)
+    return findings
+
+
+def is_denylisted(f) -> bool:
+    return _resolve(f.doc)[0].name in DENYLIST
+
+
+def _resolve_topic(slug: str) -> Path | None:
+    """Knowledge topic slug → its live file (<slug>/<slug>.md), or None."""
+    path = kt.topic_path(slug)
+    return path if path.exists() else None
+
+
+def _apply_reciprocal_add(finding, stamp: str) -> tuple[str, str]:
+    """MEDIUM one-way ## Related finding → ADD the missing reciprocal [[slug]]
+    into the TARGET file (deterministic, via related_links). title carries both
+    ends: '[[slug]]↔[[target]] one-way'. Same edit knowledge-curate's backlink
+    reconcile would make — only ever runs on explicit user approval."""
+    m = re.search(r"\[\[([^\]|]+?)\]\][^\[]*\[\[([^\]|]+?)\]\]", finding.title)
+    if not m:
+        return "nofix", f"{finding.title} — could not parse the two link ends"
+    src_slug, target = m.group(1).strip(), m.group(2).strip()
+    tpath = _resolve_topic(target)
+    if not tpath:
+        return "stale", f"{finding.title} — target {target} no longer exists"
+    text = tpath.read_text(encoding="utf-8")
+    new_text, changed = related_links.add_link(text, src_slug)
+    if not changed:
+        return "stale", f"{finding.title} — reciprocal already present"
+    _archive(tpath, stamp)
+    tpath.write_text(new_text, encoding="utf-8")
+    return "applied", f"added reciprocal [[{src_slug}]] → {_rel_doc(tpath)}"
+
+
+def _rel_doc(path: Path) -> str:
+    try:
+        return str(path.relative_to(HERMES_HOME))
+    except ValueError:
+        return str(path)
+
+
+def _llm_resolve_finding(f, stamp: str, dry_run: bool) -> tuple[str, str]:
+    """Uses the aux model to attempt to resolve an UNSURE finding.
+    Returns (status, note) where status in {'applied', 'escalated', 'nofix'}.
+    """
+    import aux_model
+    path, lineno = _resolve(f.doc)
+    if not path.exists():
+        return "nofix", f"File {f.doc} not found"
+    
+    try:
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+    except Exception as e:
+        return "nofix", f"Failed to read file: {e}"
+        
+    # Build context window around lineno
+    if lineno is not None:
+        start_idx = max(0, lineno - 4)
+        end_idx = min(len(lines), lineno + 3)
+        context_window = "".join(lines[start_idx:end_idx])
+    else:
+        context_window = text[:2000]
+
+    prompt = f"""You are the autonomous Doc Drift Resolver. Your job is to resolve discrepancies between what is written in the documentation and the live system state.
+
+Evaluate the discrepancy and decide if it can be resolved automatically, or if it must be escalated to the user.
+
+[Finding Check]: {f.check}
+[Document Path]: {f.doc}
+[Claimed in Doc]: {f.claim}
+[Actual System State]: {f.actual}
+[Why Flagged]: {f.why_unsure}
+
+[Surrounding Context File Window]:
+<<<
+{context_window}
+>>>
+
+RULES FOR RESOLUTION:
+1. RESOLVE only if it is a simple, factual update (e.g. updating a count, fixing an outdated schedule, swapping a tool name, or correcting a stale file reference in prose).
+2. The replacement text MUST exactly reflect the [Actual System State] and preserve the surrounding context.
+3. ESCALATE if:
+   - The discrepancy seems intentional (e.g., it is a historical log, an intentional approximation like "~37", or a warning of a known issue).
+   - There are multiple ways to fix it and you aren't sure which one is correct.
+   - The change would require major restructuring of the prose, rather than a simple line or paragraph correction.
+4. If you resolve, your "target_content" MUST match a unique substring in the provided context window exactly, including leading spaces/newlines.
+
+Return ONLY a JSON response:
+
+If resolving:
+{{
+  "decision": "resolve",
+  "target_content": "<the exact lines from the context window to edit>",
+  "replacement_content": "<the new Drop-in replacement content>"
+}}
+
+If escalating:
+{{
+  "decision": "escalate",
+  "reason": "<brief explanation of why this requires human/user decision>"
+}}"""
+
+    provider = os.environ.get("HERMES_CURATE_PROVIDER", "default")
+    model = os.environ.get("HERMES_CURATE_MODEL", "")
+    
+    res = aux_model.ask_json(prompt, default=None, provider=provider, model=model, temperature=0.1)
+    if not isinstance(res, dict):
+        return "escalated", "Resolver returned invalid/empty response"
+        
+    decision = res.get("decision")
+    if decision != "resolve":
+        reason = res.get("reason") or "unspecified reason"
+        return "escalated", f"LLM escalated: {reason}"
+        
+    target_content = res.get("target_content")
+    replacement_content = res.get("replacement_content")
+    
+    if not target_content or replacement_content is None:
+        return "escalated", "LLM returned resolve without target/replacement content"
+        
+    if target_content not in text:
+        return "escalated", "LLM target_content not found in the original file"
+        
+    if text.count(target_content) > 1:
+        return "escalated", "LLM target_content is not unique in the original file"
+        
+    if dry_run:
+        return "applied", f"WOULD LLM-FIX {f.title} -> {f.doc}"
+        
+    _archive(path, stamp)
+    new_text = text.replace(target_content, replacement_content, 1)
+    path.write_text(new_text, encoding="utf-8")
+    return "applied", f"LLM-fixed {f.title} -> {f.doc}"
+
+
+def apply_finding(f, stamp: str | None = None) -> tuple[str, str]:
+    """Apply ONE finding (deterministic if HIGH, LLM resolved if UNSURE). Returns (status, note)
+    where status ∈ {applied, stale, nofix}. Archives the edited file first. Does
+    NOT consult the denylist — the CALLER decides whether this finding is allowed
+    on the auto path (nightly: no) or is an explicit user approval (/drift: yes)."""
+    stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    path, lineno = _resolve(f.doc)
+    if not path.exists():
+        return "nofix", f"{f.title} ({f.doc}) — file missing"
+    if f.check == "stale_related_link":
+        # Two subtypes: DANGLING (has a swap-style proposed_fix → drop the bullet)
+        # vs ONE-WAY reciprocal-missing (proposed_fix=None → add the backlink).
+        if f.proposed_fix:
+            _archive(path, stamp)
+            ok = _apply_related_removal(path, f)
+            return ("applied", f"fixed {f.title} → {f.doc}") if ok else \
+                   ("stale", f"{f.title} ({f.doc}) — link no longer present, skipped")
+        return _apply_reciprocal_add(f, stamp)
+    
+    # If there's a deterministic proposed fix, apply it.
+    if f.proposed_fix:
+        sw = _parse_swap(f.proposed_fix)
+        if not sw:
+            return "nofix", f"{f.title} ({f.doc}) — fix not a parseable swap"
+        _archive(path, stamp)
+        ok = _apply_swap(path, lineno, *sw)
+        return ("applied", f"fixed {f.title} → {f.doc}") if ok else \
+               ("stale", f"{f.title} ({f.doc}) — line no longer matches (stale), skipped")
+               
+    # Otherwise, it's an unsure finding with no proposed_fix -> run LLM resolver
+    status, note = _llm_resolve_finding(f, stamp, dry_run=False)
+    if status == "applied":
+        return "applied", note
+    elif status == "escalated":
+        return "nofix", f"LLM resolver escalated: {note}"
+    else:
+        return "nofix", note
+
+
+def escalation_findings(findings: list | None = None) -> list:
+    """The set that goes to the user, in a STABLE order (by fingerprint) so the
+    /drift list indices stay put across back-to-back calls: every UNSURE finding
+    plus every denylisted HIGH one (certain, but a self-doc we won't auto-edit)."""
+    findings = collect_findings() if findings is None else findings
+    esc = [f for f in findings
+           if f.confidence != _ddc.HIGH or is_denylisted(f)]
+    return sorted(esc, key=_fingerprint)
+
+
+def run(dry_run: bool = False) -> tuple[list[str], list[str], list[str]]:
+    """Returns (applied_notes, skipped_stale_notes, escalation_texts)."""
+    findings = collect_findings()
+    fixable = [f for f in findings if f.confidence == _ddc.HIGH]
+    unsure = [f for f in findings if f.confidence != _ddc.HIGH]
+
+    applied: list[str] = []
+    stale: list[str] = []
+    to_escalate_findings: list = []
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    # 1. Process deterministic fixable findings
+    for f in fixable:
+        if is_denylisted(f):
+            to_escalate_findings.append(f)
+            continue
+        if dry_run:
+            applied.append(f"WOULD FIX {f.title} → {f.doc}")
+            continue
+        status, note = apply_finding(f, stamp)
+        (applied if status == "applied" else stale).append(note)
+
+    # 2. Process unsure findings with the LLM resolver
+    for f in unsure:
+        if is_denylisted(f):
+            to_escalate_findings.append(f)
+            continue
+        # Attempt LLM resolution on the auto path
+        status, note = _llm_resolve_finding(f, stamp, dry_run)
+        if status == "applied":
+            applied.append(note)
+        elif status == "escalated":
+            to_escalate_findings.append(f)
+        else:
+            stale.append(note)
+
+    # Sort escalation findings for stable list order
+    to_escalate_findings = sorted(to_escalate_findings, key=_fingerprint)
+
+    # 3. Process remaining escalations with 3-day cooldown + honour explicit /drift dismissals.
+    pending = _load_pending()
+    dismissed = pending.get(_DISMISS_KEY, {}) if isinstance(pending, dict) else {}
+    now = _now()
+    escalations: list[str] = []
+    still_pending: dict = {_DISMISS_KEY: dict(dismissed)}
+    for f in to_escalate_findings:
+        key = _fingerprint(f)
+        if dismissed.get(key) == f.delta:   # user silenced it and nothing changed
+            continue
+        prev = pending.get(key)
+        changed = (prev or {}).get("delta") != f.delta
+        first_seen = None if (prev is None or changed) else datetime.fromisoformat(prev["first_seen"])
+        due = first_seen is None or (now - first_seen) >= timedelta(days=COOLDOWN_DAYS)
+        if due:
+            escalations.append(_escalation_text(f))
+            first_seen = now
+        still_pending[key] = {"first_seen": (first_seen or now).isoformat(),
+                              "delta": f.delta, "title": f.title, "doc": f.doc}
+    if not dry_run:
+        _save_pending(still_pending)
+
+    return applied, stale, escalations
+
+
+def dismiss(fingerprint: str, delta: str) -> None:
+    """Record a /drift dismissal so the nightly applier stops escalating this
+    finding until its delta changes. Merges into the reserved pending key."""
+    pending = _load_pending()
+    if not isinstance(pending, dict):
+        pending = {}
+    d = pending.get(_DISMISS_KEY, {})
+    d[fingerprint] = delta
+    pending[_DISMISS_KEY] = d
+    _save_pending(pending)
+
+
+def main() -> int:
+    dry = "--dry-run" in sys.argv
+    applied, stale, escalations = run(dry_run=dry)
+    if not applied and not stale and not escalations:
+        return 0  # silent: nothing to do
+
+    out = ["🩹 *Doc Drift Applier*" + (" (dry-run)" if dry else "")]
+    if applied:
+        out.append(f"\n*Auto-applied ({len(applied)}):*")
+        out += [f"• {a}" for a in applied]
+    if stale:
+        out.append(f"\n*Skipped as stale ({len(stale)}):*")
+        out += [f"• {s}" for s in stale]
+    if escalations:
+        out.append(f"\n*Needs your call ({len(escalations)}):*")
+        out += escalations
+        out.append("\n_Resolve with_ `/drift` _(list) →_ `/drift apply N` _or_ `/drift dismiss N`_._")
+    print("\n".join(out))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

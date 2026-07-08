@@ -1,0 +1,7 @@
+name: know-mode
+version: 0.1.0
+description: "/know-mode slash command -- view or set the per-platform L3 knowledge-injection mode (off/toc/full) used by hooks/knowledge-inject.py. User-only by construction (a slash command, not a tool, so the model can never change it). State lives in knowledge/.system/know-mode.json; the platform normalizer is shared with the hook via hooks/knowledge_mode.py. Registers no tools."
+kind: standalone
+platforms:
+  - linux
+provides_tools: []

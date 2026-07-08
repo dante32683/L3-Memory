@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""artifact-route — file an inbound attachment into the right topic.
+
+When Hermes receives a file (e.g. a textbook on Telegram), stock caches it to a
+local path and sets event.media_urls. This router decides WHICH topic the file
+belongs to (mimo — low-frequency, accuracy-sensitive) and files it:
+
+  * Every topic is a folder: knowledge/<slug>/<slug>.md + knowledge/<slug>/files/.
+    A brand-new topic is created directly in that shape; an existing topic's
+    files/ just gains the new attachment. No flat form, no promotion step.
+
+mimo only makes the routing decision (slug + new/existing + title/aliases). All
+file operations are deterministic Python — reliable regardless of the model.
+
+Usage:
+  artifact-route --file /path/to/textbook.pdf --caption "physics 40 textbook"
+  artifact-route --file ... --caption ... --dry-run     # show decision only
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from aux_model import ask_json  # noqa: E402
+import knowledge_topics as kt  # noqa: E402
+
+HERMES_HOME = Path(os.environ.get("L3_HOME", os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))))
+KNOW = HERMES_HOME / "knowledge"
+PROVIDER = os.environ.get("HERMES_ARTIFACT_PROVIDER", "default")
+# Quality-sensitive routing decision (creates new topic folders if needed);
+# set HERMES_ARTIFACT_MODEL to a higher-quality model for fewer misroutes.
+ARTIFACT_MODEL = os.environ.get("HERMES_ARTIFACT_MODEL", "")
+_slugify = kt.slugify
+
+
+def _topics() -> list[dict]:
+    return [kt.topic_meta(slug, text) for slug, text, _files in kt.iter_topics()]
+
+
+def _decide(caption: str, filename: str, topics: list[dict]) -> dict | None:
+    tl = "\n".join(f"- {t['slug']}: {t['title']} (aliases: {t['aliases']})" for t in topics)
+    prompt = f"""The user sent a FILE to their personal assistant and wants it filed
+under the right topic (a class, project, or life area).
+
+Existing topics:
+{tl}
+
+Incoming file name: {filename}
+Message/caption: {caption or '(none)'}
+
+Decide where it belongs. Return ONLY JSON:
+- If it clearly belongs to an EXISTING topic:
+  {{"action":"existing","slug":"<existing slug>"}}
+- If it needs a NEW topic (e.g. a class/project not listed):
+  {{"action":"new","slug":"<short-kebab-slug>","title":"<Title>","aliases":["...4-8 lowercase..."]}}
+
+ALIASES must be SPECIFIC identifiers that uniquely point to THIS topic: course
+number variants ("physics 40","phys 40","p40"), instructor name, distinctive
+subject. NEVER generic words like "class","homework","textbook","syllabus",
+"notes","project","reading" — those match everything and are useless.
+
+RULES:
+- Each specific CLASS/COURSE is ALWAYS its own topic, named after the course:
+  "physics-40", "chem-12b", "math-3a". NEVER a generic bucket like "classes",
+  "school", "homework", or "courses".
+- Likewise each distinct PROJECT is its own topic, not a generic "projects" bucket.
+- Prefer an existing topic only when the file genuinely fits one; otherwise make
+  the specific new topic.
+- Pick exactly one."""
+    return ask_json(prompt, default=None, temperature=0.1, provider=PROVIDER, model=ARTIFACT_MODEL)
+
+
+def _ensure_folder(slug: str, decision: dict) -> Path:
+    """Return the topic folder, creating a new stub if this slug doesn't exist yet."""
+    folder = KNOW / slug
+    body = kt.topic_path(slug)
+    if not body.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+        title = decision.get("title") or slug.replace("-", " ").title()
+        aliases = decision.get("aliases") or [slug]
+        body.write_text(
+            f"---\ntitle: {title}\naliases: [{', '.join(aliases)}]\n"
+            f"source: auto-created by artifact-route\n---\n\n# {title}\n",
+            encoding="utf-8",
+        )
+    (folder / "files").mkdir(exist_ok=True)
+    return folder
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--file", required=True)
+    ap.add_argument("--caption", default="")
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+
+    src = Path(args.file)
+    filename = src.name
+    topics = _topics()
+    decision = _decide(args.caption, filename, topics)
+    if not isinstance(decision, dict) or not decision.get("slug"):
+        print(json.dumps({"error": "routing failed", "decision": decision}), file=sys.stderr)
+        return 1
+    slug = _slugify(decision["slug"])
+    existing = {t["slug"] for t in topics}
+    kind = "existing" if slug in existing else "new"
+
+    if args.dry_run:
+        print(json.dumps({"file": filename, "caption": args.caption,
+                          "decided_slug": slug, "kind": kind,
+                          "raw": decision}))
+        return 0
+
+    folder = _ensure_folder(slug, decision)
+    dest = folder / "files" / filename
+    if src.exists():
+        shutil.copy2(src, dest)
+    print(json.dumps({"filed": str(dest), "slug": slug, "kind": kind}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

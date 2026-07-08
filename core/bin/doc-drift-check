@@ -1,0 +1,990 @@
+#!/usr/bin/env python3
+"""doc-drift-check — deterministic doc-vs-reality drift detector (Phase 1).
+
+Compares specific, machine-derivable facts (plugin count, cron topology,
+skill counts, nudge intervals) against the claims made about them in the
+knowledge base + PATCHES.md, and writes a single dated report.
+
+Phase 1 is PURE: stdlib + pyyaml only, NO LLM call, NO writes to any doc.
+The only file it writes is ``knowledge/.system/drift-YYYY-MM-DD.md``. The
+report has two deterministically-split sections:
+
+    ## FIXABLE   — high-confidence: the actual value is uniquely defined by a
+                   source of truth AND the doc has a specific token to swap.
+                   Each item carries a ``proposed_fix`` (a surgical diff).
+    ## UNSURE    — medium/low-confidence: the value is clear but the doc's
+                   intent is ambiguous (derived/approximate/possibly historical).
+                   Each item carries ``why_unsure`` and ``proposed_fix: None``.
+
+A future Phase 2 (LLM reviewer) consumes this file, applies the FIXABLE items
+it agrees with, and escalates only the genuinely ambiguous UNSURE items to the
+user. Phase 1 NEVER mutates docs — it only reports.
+
+stdout contract (parsed by scripts/doc-drift-check-cron.py):
+    "drift: clean"                          → no drift, wrapper stays silent
+    "drift: <n> fixable, <m> unsure"        → wrapper emits a Telegram digest
+    nonzero exit + stderr                   → wrapper surfaces a terse alert
+
+Idempotent: re-running the same day overwrites the day's report; the prior
+report (any date) is archived to ``knowledge/.system/.archive/`` first, mirror
+of the INBOX.archive convention used by knowledge-curate.
+
+To add a check: write a function returning ``list[Finding]`` and append it to
+``CHECKS``. Each check reads its source of truth fresh and scans only the
+doc files it cares about.
+"""
+from __future__ import annotations
+
+import difflib
+import json
+import os
+import sys as _sys
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import related_links as _rl  # shared ## Related block parser (bin/related_links.py)
+except Exception:               # pragma: no cover
+    _rl = None
+import knowledge_topics as _kt  # single source of truth for topic layout
+import re
+import shutil
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+from typing import Callable, Optional
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - pyyaml ships in the hermes-agent venv
+    yaml = None
+
+HERMES_HOME = Path(os.environ.get("L3_HOME", os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))))
+KNOW = HERMES_HOME / "knowledge"
+SYSTEM = KNOW / ".system"
+REPORT_ARCHIVE = SYSTEM / ".archive"
+CONFIG = HERMES_HOME / "config.yaml"
+JOBS = HERMES_HOME / "cron" / "jobs.json"
+PLUGINS = HERMES_HOME / "plugins"
+SKILLS = HERMES_HOME / "skills"
+PATCHES = HERMES_HOME / "PATCHES.md"
+
+# Confidence levels: HIGH routes to FIXABLE, everything else to UNSURE.
+HIGH = "high"
+MEDIUM = "medium"
+LOW = "low"
+
+
+@dataclass
+class Finding:
+    check: str          # check id (groups items in the report)
+    title: str          # short human label for this specific claim
+    doc: str            # "relative/path.md:LINE"
+    claim: str          # what the doc currently asserts
+    actual: str         # the source-of-truth value
+    delta: str          # one-line human description of the gap
+    confidence: str     # HIGH | MEDIUM | LOW
+    proposed_fix: Optional[str] = None   # surgical "- old\n+ new" diff, or None
+    why_unsure: Optional[str] = None     # required when confidence != HIGH
+
+
+# --------------------------------------------------------------------------- #
+# Doc-scanning helpers
+# --------------------------------------------------------------------------- #
+def _rel(path: Path) -> str:
+    try:
+        return str(path.relative_to(HERMES_HOME))
+    except ValueError:
+        return str(path)
+
+
+def _scan(path: Path, pattern: str):
+    """Yield (lineno, line, match) for every regex hit in a doc file.
+
+    The pattern must expose the value-to-compare as group(1).
+    """
+    if not path.exists():
+        return
+    rx = re.compile(pattern)
+    for i, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        for m in rx.finditer(line):
+            yield i, line, m
+
+
+def _swap_fix(line: str, old_token: str, new_token: str) -> str:
+    """Build a one-line proposed diff swapping the first old_token → new_token."""
+    new_line = line.replace(old_token, new_token, 1)
+    return f"- {line.strip()}\n+ {new_line.strip()}"
+
+
+# --------------------------------------------------------------------------- #
+# Source-of-truth readers
+# --------------------------------------------------------------------------- #
+def _load_config() -> dict:
+    if yaml is None or not CONFIG.exists():
+        return {}
+    try:
+        return yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def _load_jobs() -> list[dict]:
+    if not JOBS.exists():
+        return []
+    try:
+        d = json.loads(JOBS.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return d if isinstance(d, list) else d.get("jobs", [])
+
+
+# --------------------------------------------------------------------------- #
+# Checks
+# --------------------------------------------------------------------------- #
+def check_plugin_count() -> list[Finding]:
+    """`ls plugins/*/plugin.yaml` is the canonical plugin count. Docs phrase it
+    as "N plugins" or "X of N plugins" (an index out of the total)."""
+    actual = len(list(PLUGINS.glob("*/plugin.yaml")))
+    if actual == 0:
+        return []
+    out: list[Finding] = []
+    # "X of N plugins"  → N is the total, must equal actual.
+    for doc in (PATCHES, KNOW / "hermes-plugins.md"):
+        for lineno, line, m in _scan(doc, r"of (\d+) plugins?\b"):
+            claimed = int(m.group(1))
+            if claimed != actual:
+                out.append(Finding(
+                    check="plugin_count",
+                    title=f'"of {claimed} plugins" (total)',
+                    doc=f"{_rel(doc)}:{lineno}",
+                    claim=f"{claimed} plugins total",
+                    actual=f"{actual} plugin.yaml dirs",
+                    delta=f"total drifted {claimed} → {actual}",
+                    confidence=HIGH,
+                    proposed_fix=_swap_fix(line, f"of {claimed} plugin", f"of {actual} plugin"),
+                ))
+    return out
+
+
+def check_cron_topology() -> list[Finding]:
+    """jobs.json is canonical for cron topology. We derive three numbers:
+    total jobs, active-recurring (enabled + kind=='cron'), and disabled count.
+    Total is HIGH (a unique count). Active-recurring is MEDIUM — "recurring"
+    is a derivation (we exclude one-shots and disabled), and a doc may scope
+    the phrase differently, so it goes to UNSURE for human/LLM judgement."""
+    jobs = _load_jobs()
+    if not jobs:
+        return []
+    total = len(jobs)
+    active_recurring = sum(
+        1 for j in jobs
+        if j.get("enabled") and (j.get("schedule") or {}).get("kind") == "cron"
+    )
+    out: list[Finding] = []
+    crons_doc = KNOW / "hermes-crons.md"
+
+    # --- total jobs (HIGH) -------------------------------------------------- #
+    # "**15 jobs**" style claims in hermes-crons.md.
+    for lineno, line, m in _scan(crons_doc, r"\*\*(\d+) jobs\*\*"):
+        claimed = int(m.group(1))
+        if claimed != total:
+            out.append(Finding(
+                check="cron_total",
+                title=f'"{claimed} jobs" defined',
+                doc=f"{_rel(crons_doc)}:{lineno}",
+                claim=f"{claimed} jobs total",
+                actual=f"{total} jobs in cron/jobs.json",
+                delta=f"total drifted {claimed} → {total}",
+                confidence=HIGH,
+                proposed_fix=_swap_fix(line, f"**{claimed} jobs**", f"**{total} jobs**"),
+            ))
+    # NOTE: PATCHES' "X of N crons" / "X of N plugins" annotations are an
+    # internal running tally (the Nth of the custom items PATCHES documents),
+    # NOT a claim about live topology — N can't be derived deterministically
+    # from cron/jobs.json (it excludes personal reminders, includes the
+    # disabled template, etc.). Comparing it to the live recurring count
+    # produced persistent false-ish UNSURE noise, so it is intentionally NOT
+    # checked here. The authoritative total ("**N jobs**") and the
+    # "**N active recurring**" claim below cover real cron-topology drift.
+
+    # --- active recurring (MEDIUM → UNSURE) --------------------------------- #
+    for lineno, line, m in _scan(crons_doc, r"\*\*(\d+) active recurring\*\*"):
+        claimed = int(m.group(1))
+        if claimed != active_recurring:
+            out.append(Finding(
+                check="cron_active_recurring",
+                title=f'"{claimed} active recurring"',
+                doc=f"{_rel(crons_doc)}:{lineno}",
+                claim=f"{claimed} active recurring",
+                actual=f"{active_recurring} enabled jobs with schedule.kind=='cron'",
+                delta=f"active recurring drifted {claimed} → {active_recurring}",
+                confidence=MEDIUM,
+                why_unsure=(
+                    '"active recurring" is derived as (enabled AND schedule.kind==cron). '
+                    "The doc may define it more narrowly (e.g. system jobs only, "
+                    "excluding one-off-style reminders that recur). Verify the intended "
+                    "definition before swapping the number — and the prose list of job "
+                    "names beside it may also need updating."
+                ),
+                proposed_fix=None,
+            ))
+    return out
+
+
+def check_cron_schedules() -> list[Finding]:
+    """For each enabled cron job, if a doc line names that job AND quotes a
+    backticked 5-field cron expression, the expr must match jobs.json. A
+    mismatch is HIGH confidence (a specific expr swap)."""
+    jobs = _load_jobs()
+    if not jobs:
+        return []
+    name_to_expr = {
+        j["name"]: (j.get("schedule") or {}).get("expr")
+        for j in jobs
+        if j.get("enabled")
+        and (j.get("schedule") or {}).get("kind") == "cron"
+        and (j.get("schedule") or {}).get("expr")
+        and j.get("name")
+    }
+    if not name_to_expr:
+        return []
+
+    def names_job(line: str, name: str) -> bool:
+        """Return True only when the line is documenting this job itself.
+
+        A plain substring match is too broad: schedule bullets often mention a
+        second job in prose (e.g. "runs after doc-drift-check"), and the old
+        matcher could then apply that second job's schedule to the wrong bullet.
+        Canonical docs use bold job bullets; PATCHES.md usually wraps cron names
+        in backticks. Require one of those explicit forms.
+        """
+        return f"**{name}**" in line or f"`{name}`" in line
+
+    # A backticked 5-field cron expression.
+    expr_rx = re.compile(r"`([0-9*][0-9*/,\- ]*(?: [0-9*/,\-]+){4})`")
+    out: list[Finding] = []
+    for doc in (KNOW / "hermes-crons.md", PATCHES):
+        if not doc.exists():
+            continue
+        for lineno, line in enumerate(
+            doc.read_text(encoding="utf-8", errors="replace").splitlines(), 1
+        ):
+            exprs = [m.group(1).strip() for m in expr_rx.finditer(line)]
+            if not exprs:
+                continue
+            for name, true_expr in name_to_expr.items():
+                if not names_job(line, name):
+                    continue
+                # The job is named on this line and an expr is quoted here.
+                # Flag only if NONE of the quoted exprs match the true one
+                # (a line may legitimately quote several exprs).
+                if true_expr not in exprs:
+                    wrong = exprs[0]
+                    out.append(Finding(
+                        check="cron_schedule",
+                        title=f'{name}: schedule',
+                        doc=f"{_rel(doc)}:{lineno}",
+                        claim=f"`{wrong}`",
+                        actual=f"`{true_expr}` in cron/jobs.json",
+                        delta=f"schedule drifted `{wrong}` → `{true_expr}`",
+                        confidence=HIGH,
+                        proposed_fix=_swap_fix(line, f"`{wrong}`", f"`{true_expr}`"),
+                    ))
+    return out
+
+
+def check_skill_counts() -> list[Finding]:
+    """skills/ holds N SKILL.md files; config.yaml skills.disabled lists D of
+    them; active = N - D. The on-disk count (N) and disabled count (D) are
+    HIGH (unique counts with explicit tokens in the doc). The derived "active"
+    number is usually written approximately ("~37") and is a formula the doc
+    doesn't state, so it is MEDIUM → UNSURE."""
+    # SKILL.md files nest at varying depths (skills/<cat>/<skill>/SKILL.md and
+    # deeper sub-skills), so the count must be recursive to match `find`.
+    on_disk = len(list(SKILLS.rglob("SKILL.md")))
+    cfg = _load_config()
+    disabled = len((cfg.get("skills") or {}).get("disabled") or [])
+    if on_disk == 0:
+        return []
+    active = on_disk - disabled
+    out: list[Finding] = []
+    know_doc = KNOW / "hermes-knowledge.md"
+
+    for lineno, line, m in _scan(know_doc, r"(\d+) SKILL\.md"):
+        claimed = int(m.group(1))
+        if claimed != on_disk:
+            out.append(Finding(
+                check="skill_on_disk",
+                title=f'"{claimed} SKILL.md files"',
+                doc=f"{_rel(know_doc)}:{lineno}",
+                claim=f"{claimed} SKILL.md on disk",
+                actual=f"{on_disk} SKILL.md files",
+                delta=f"on-disk skills drifted {claimed} → {on_disk}",
+                confidence=HIGH,
+                proposed_fix=_swap_fix(line, f"{claimed} SKILL.md", f"{on_disk} SKILL.md"),
+            ))
+    # "the 45 in `config.yaml: skills.disabled:`"
+    for lineno, line, m in _scan(know_doc, r"the (\d+) in `?config\.yaml: ?skills\.disabled"):
+        claimed = int(m.group(1))
+        if claimed != disabled:
+            out.append(Finding(
+                check="skill_disabled",
+                title=f'"{claimed} disabled skills"',
+                doc=f"{_rel(know_doc)}:{lineno}",
+                claim=f"{claimed} disabled in config",
+                actual=f"{disabled} entries in skills.disabled",
+                delta=f"disabled count drifted {claimed} → {disabled}",
+                confidence=HIGH,
+                proposed_fix=_swap_fix(line, f"the {claimed} in", f"the {disabled} in"),
+            ))
+    # "~37 active skills" — approximate + derived → UNSURE.
+    for lineno, line, m in _scan(know_doc, r"~(\d+) active skills"):
+        claimed = int(m.group(1))
+        if claimed != active:
+            out.append(Finding(
+                check="skill_active",
+                title=f'"~{claimed} active skills"',
+                doc=f"{_rel(know_doc)}:{lineno}",
+                claim=f"~{claimed} active skills",
+                actual=f"{active} active (= {on_disk} on disk − {disabled} disabled)",
+                delta=f"active skills drifted ~{claimed} → {active}",
+                confidence=MEDIUM,
+                why_unsure=(
+                    'Written with a "~" (approximate) and derived as on_disk − disabled; '
+                    "the doc states neither operand. May be an intentionally rounded "
+                    "figure rather than drift. Update only if an exact count is wanted."
+                ),
+                proposed_fix=None,
+            ))
+    return out
+
+
+def check_nudge_intervals() -> list[Finding]:
+    """config.yaml is canonical for the two background-review nudge intervals.
+    Docs quote them inline as ``nudge_interval:10`` / ``creation_nudge_interval:10``;
+    a mismatched number is a HIGH-confidence swap."""
+    cfg = _load_config()
+    truth = {
+        "nudge_interval": (cfg.get("memory") or {}).get("nudge_interval"),
+        "creation_nudge_interval": (cfg.get("skills") or {}).get("creation_nudge_interval"),
+    }
+    out: list[Finding] = []
+    for key, actual in truth.items():
+        if actual is None:
+            continue
+        # Match `nudge_interval:10`, `nudge_interval: 10`, with optional backticks.
+        # Use a negative lookbehind so `creation_nudge_interval` doesn't also
+        # match the `nudge_interval` pattern.
+        if key == "nudge_interval":
+            pattern = r"(?<![\w_])nudge_interval`?:`? ?(\d+)"
+        else:
+            pattern = r"creation_nudge_interval`?:`? ?(\d+)"
+        for doc in (PATCHES, KNOW / "hermes-knowledge.md"):
+            for lineno, line, m in _scan(doc, pattern):
+                claimed = int(m.group(1))
+                if claimed != actual:
+                    old = m.group(0)
+                    new = old.replace(str(claimed), str(actual))
+                    out.append(Finding(
+                        check="nudge_interval",
+                        title=f"{key}:{claimed}",
+                        doc=f"{_rel(doc)}:{lineno}",
+                        claim=f"{key} = {claimed}",
+                        actual=f"{key} = {actual} in config.yaml",
+                        delta=f"{key} drifted {claimed} → {actual}",
+                        confidence=HIGH,
+                        proposed_fix=_swap_fix(line, old, new),
+                    ))
+    return out
+
+
+_RELATED_HEADING_RE = re.compile(r"^#{1,6}[ \t]+Related(?:[ \t]+topics)?[ \t]*$", re.I)
+_WIKILINK_RE = re.compile(r"\[\[([^\]|]+?)(?:\|[^\]]+)?\]\]")
+
+
+def _knowledge_slugs() -> set[str]:
+    """Knowledge topic slugs (every topic is a folder <slug>/<slug>.md)."""
+    return {slug.lower() for slug, _text, _files in _kt.iter_topics()}
+
+
+def _skill_slugs() -> set[str]:
+    """Skill link targets = each SKILL.md's parent directory name, at any depth
+    (skills nest 1-3 levels deep, e.g. productivity/pdf/SKILL.md → 'pdf')."""
+    if not SKILLS.is_dir():
+        return set()
+    return {s.parent.name.lower() for s in SKILLS.rglob("SKILL.md")}
+
+
+def _known_link_targets() -> set[str]:
+    """Every valid ## Related target on this instance: knowledge topic slugs
+    ONLY. Skills are never a valid wikilink target — every skill file is
+    literally named SKILL.md, and Obsidian's resolver only ever matches a
+    link against a real filename, never frontmatter `aliases:` (confirmed
+    against Obsidian's own docs: "[[AI]]" is never used as a link destination,
+    only "[[Artificial Intelligence|AI]]"), so a [[skill-name]] link can never
+    resolve. knowledge-curate no longer generates skill-target links (see
+    _integrate_skill)."""
+    return _knowledge_slugs()
+
+
+def _related_bullets(path: Path) -> list[tuple[int, str]]:
+    """(lineno, target) for every wikilink inside a file's LAST ## Related block."""
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    last_heading = None
+    for i, line in enumerate(lines):
+        if _RELATED_HEADING_RE.match(line):
+            last_heading = i
+    if last_heading is None:
+        return []
+    out: list[tuple[int, str]] = []
+    for i in range(last_heading + 1, len(lines)):
+        for m in _WIKILINK_RE.finditer(lines[i]):
+            out.append((i + 1, m.group(1).strip()))
+    return out
+
+
+def check_stale_related_links() -> list[Finding]:
+    """Cross-link integrity for the ## Related convention (Phase 3).
+
+    - DANGLING link ([[x]] whose target topic/skill no longer exists) → FIXABLE:
+      the fix is unambiguous (drop the stale bullet). A rename is the only other
+      reading, and a reviewer can repoint instead of deleting if that's the case.
+    - MISSING RECIPROCAL (A links B, both real, but B doesn't link A) → UNSURE:
+      knowledge-curate's backlink reconcile normally self-heals this on its next
+      run, so it's low-urgency and only surfaced (never auto-applied here) if the
+      curator hasn't run since the asymmetry appeared."""
+    if _rl is None or not KNOW.is_dir():
+        return []
+    known = _known_link_targets()
+    # Knowledge files own the reciprocity contract (knowledge-curate reconciles
+    # backlinks only among them). Skills are NOT valid link targets at all — any
+    # [[skill-name]] found here is dangling by definition and flagged as such.
+    know_files: dict[str, Path] = {
+        slug.lower(): _kt.topic_path(slug) for slug, _text, _files in _kt.iter_topics()
+    }
+    fwd = {slug: {t.lower() for _, t in _related_bullets(p)} for slug, p in know_files.items()}
+
+    out: list[Finding] = []
+    for slug, path in know_files.items():
+        for lineno, target in _related_bullets(path):
+            tl = target.lower()
+            if tl not in known:
+                out.append(Finding(
+                    check="stale_related_link",
+                    title=f'dangling [[{target}]] in {slug}',
+                    doc=f"{_rel(path)}:{lineno}",
+                    claim=f"## Related links to [[{target}]]",
+                    actual="no topic/skill by that slug exists",
+                    delta=f"stale cross-link → target `{target}` missing",
+                    confidence=HIGH,
+                    proposed_fix=f"- - [[{target}]]\n+ (remove stale ## Related bullet)",
+                ))
+            elif tl in know_files and tl != slug and slug not in fwd.get(tl, set()):
+                out.append(Finding(
+                    check="stale_related_link",
+                    title=f'[[{slug}]]↔[[{target}]] one-way',
+                    doc=f"{_rel(path)}:{lineno}",
+                    claim=f"{slug} links [[{target}]]",
+                    actual=f"{target} has no reciprocal [[{slug}]]",
+                    delta="one-directional ## Related link (reciprocal missing)",
+                    confidence=MEDIUM,
+                    proposed_fix=None,
+                    why_unsure="knowledge-curate's backlink reconcile normally adds "
+                               "the reciprocal on its next run; flagged only if stale.",
+                ))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Tool-name drift on the SECURITY ENFORCEMENT layer (Phase 3c)
+# --------------------------------------------------------------------------- #
+# Motivating incident: consolidating calendar/gtasks/canvas/drive tools
+# (2026-07-02, see project_hermes_tool_schema_consolidation) required a fully
+# manual grep sweep of $HERMES_HOME to find every stale reference to a renamed
+# tool. The single highest-severity blind spot in that sweep is a hook
+# `matcher:` or `DESTRUCTIVE` literal that still names a tool that no longer
+# exists — the hook then silently STOPS FIRING for the renamed tool: a security
+# gate bypass, not a crash, not a log line.
+#
+# SCOPE — deliberately narrow. An earlier broad version that scanned all docs/
+# skills/hooks produced ~118 findings, ALL false positives, because:
+#   * docs legitimately name old tools historically ("was `calendar_add_event`,
+#     now `calendar_event`") — correct writing, not drift;
+#   * stock (non-plugin) tools share prefixes (`search_files` is a core tool);
+#   * a plugin's own source contains its namespace's helper fns (`canvas.py`
+#     defines `canvas_assignments()`), and `office_lock.py` is a module;
+#   * generic-word prefixes collide (`save_checkpoint`, `remote_path`).
+# None of those live on the enforcement layer, where a token is ALWAYS a literal
+# tool name. So this check scans ONLY:
+#   1. config.yaml hook `matcher:` values, and
+#   2. the destructive-gate hooks' quoted tool-name literals
+#      (hooks/ext-action-gate.py + plugins/ext-action-buttons/__init__.py).
+# and only for prefixes owned by a dedicated `plugins/<prefix>-tools/` directory
+# (calendar/canvas/drive/gmail/gtasks/office) — which excludes the generic-word
+# namespaces (save_/search_/remote_/server_) entirely.
+#
+# NOTE for whoever extends this: a SECOND memory system (this agent's own memory
+# files under ~/.claude/projects/-home-ubuntu/memory/) watches the same tool
+# names but lives outside $HERMES_HOME — sweep it by hand on any tool rename.
+
+# The destructive-gate enforcement files whose quoted tool literals must name
+# only live tools (a stale key here = a destructive action silently ungated).
+ENFORCEMENT_FILES = [
+    HERMES_HOME / "hooks" / "ext-action-gate.py",
+    PLUGINS / "ext-action-buttons" / "__init__.py",
+]
+
+
+def _plugin_tools() -> set[str]:
+    """Union of every plugins/*/plugin.yaml `provides_tools:` list."""
+    tools: set[str] = set()
+    if yaml is None:
+        return tools
+    for py in PLUGINS.glob("*/plugin.yaml"):
+        try:
+            d = yaml.safe_load(py.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        for t in d.get("provides_tools") or []:
+            if isinstance(t, str) and t.strip():
+                tools.add(t.strip())
+    return tools
+
+
+def _owned_tool_prefixes(tools: set[str]) -> set[str]:
+    """`<prefix>` of each `<prefix>_<verb>` tool, kept ONLY when a dedicated
+    `plugins/<prefix>-tools/` directory owns that namespace. This drops the
+    generic-word prefixes (save_/search_/remote_/server_) that collide with
+    ordinary identifiers and stock tools, leaving a distinctive, low-false-
+    positive set (calendar/canvas/drive/gmail/gtasks/office)."""
+    out: set[str] = set()
+    for t in tools:
+        if "_" not in t:
+            continue
+        p = t.split("_", 1)[0]
+        if (PLUGINS / f"{p}-tools").is_dir():
+            out.add(p)
+    return out
+
+
+def check_tool_name_references() -> list[Finding]:
+    """Flag stale plugin-tool names on the SECURITY ENFORCEMENT layer only.
+
+    Always UNSURE (proposal-only): the replacement can't be inferred
+    deterministically — a consolidation folds the old verb into an `action` arg,
+    so the check can't know which live tool the matcher/gate should now name —
+    and these are security-sensitive files that must NEVER be auto-edited. The
+    check surfaces the exact file+line for a human/LLM to repoint."""
+    tools = _plugin_tools()
+    prefixes = _owned_tool_prefixes(tools)
+    if not tools or not prefixes:
+        return []
+    alt = "|".join(sorted(map(re.escape, prefixes), key=len, reverse=True))
+    # A `<prefix>_<verb...>` token not glued to a surrounding identifier.
+    token_rx = re.compile(rf"(?<![\w-])({alt})_[a-z0-9]+(?:_[a-z0-9]+)*(?![\w-])")
+    # In the gate .py files, only QUOTED tokens are tool literals (dict keys /
+    # set members); bare tokens in comments like `calendar_*/gtasks_*` must be
+    # ignored, so require an enclosing quote or backtick.
+    quoted_rx = re.compile(
+        rf"[\"'`]((?:{alt})_[a-z0-9]+(?:_[a-z0-9]+)*)[\"'`]"
+    )
+    sib = lambda tok: sorted(t for t in tools if t.split("_", 1)[0] == tok.split("_", 1)[0])
+    seen: set[tuple[str, int, str]] = set()
+    out: list[Finding] = []
+
+    def consider(path: Path, token: str, lineno: int, surface: str) -> None:
+        if token in tools:
+            return
+        # Suppress identifiers DERIVED from a live tool (`drive_manage_args`).
+        if any(token.startswith(kt + "_") for kt in tools):
+            return
+        key = (_rel(path), lineno, token)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(Finding(
+            check="tool_name_ref",
+            title=f"stale tool `{token}` in {surface}",
+            doc=f"{_rel(path)}:{lineno}",
+            claim=f"{surface} references tool `{token}`",
+            actual=f"no such tool; live {token.split('_', 1)[0]}_* tools: "
+                   + (", ".join(sib(token)) or "(none)"),
+            delta=f"`{token}` not in any plugin.yaml provides_tools",
+            confidence=MEDIUM,
+            why_unsure=(
+                f"A stale tool name on the {surface} means the gate silently stops "
+                "firing for the renamed tool — a security bypass. The replacement can't "
+                "be inferred deterministically (a consolidation folds the old verb into "
+                "an `action` arg), and this file must not be auto-edited: a human/LLM "
+                "must repoint it. Also sweep this agent's separate memory files "
+                "(outside $HERMES_HOME)."
+            ),
+            proposed_fix=None,
+        ))
+
+    # 1. config.yaml hook matcher values.
+    if CONFIG.exists():
+        for lineno, line, m in _scan(CONFIG, token_rx.pattern):
+            if "matcher" in line:
+                consider(CONFIG, m.group(0), lineno, "config.yaml hook matcher")
+    # 2. Destructive-gate hook tool literals (quoted only).
+    for path in ENFORCEMENT_FILES:
+        for lineno, _line, m in _scan(path, quoted_rx.pattern):
+            consider(path, m.group(1), lineno, "destructive-gate literal")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Knowledge <-> skill overlap detection (Phase 3 core, knowledge-skill-pipeline
+# plan). Three independent sub-detectors folded into one check. Kept stdlib-
+# only and conservative on purpose: `check_tool_name_references`'s first draft
+# scanned broadly and produced 118/118 false positives before being narrowed
+# (see its docstring) — every sub-detector here either targets a structurally
+# unambiguous pattern (a literal file path that either exists or doesn't) or
+# always escalates UNSURE rather than guessing at a fix. Unlike the dangling
+# `## Related` bullet case (a clean, isolated list item — see
+# check_stale_related_links), a stale cross-reference here can sit mid-sentence
+# in arbitrary prose, so there is no safe deterministic "remove this" fix the
+# way there is for a bullet; all findings here are UNSURE, proposed_fix=None.
+# --------------------------------------------------------------------------- #
+_KNOW_REF_RE = re.compile(r"knowledge/([A-Za-z0-9_-]+)\.md")
+_SKILL_REF_RE = re.compile(r"skills/(?:[A-Za-z0-9_-]+/)*([A-Za-z0-9_-]+)/SKILL\.md")
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_OVERLAP_STOPWORDS = {
+    "this", "that", "with", "from", "have", "when", "what", "your", "user",
+    "file", "files", "into", "also", "then", "than", "only", "never",
+    "always", "should", "does", "use", "used", "using", "and", "the", "for",
+    "are", "was", "were", "any", "all", "not", "its", "their", "them", "can",
+    "will", "would", "each", "such", "more", "some", "must", "skill",
+}
+# Tuned against the live vault (59 knowledge files / 90 SKILL.md, 2026-07-06
+# dry run) rather than picked blind — see PATCHES.md for the before/after
+# finding counts at the thresholds that were tried.
+_ALIAS_OVERLAP_THRESHOLD = 0.5   # Jaccard over distinctive tokens
+_ALIAS_MIN_SHARED = 3            # below this, overlap is coincidental noise
+_PARA_MIN_CHARS = 60             # ignore fragments too short to be meaningful
+_PARA_SIMILARITY_THRESHOLD = 0.85  # difflib ratio
+
+
+def _live_skill_files() -> list[Path]:
+    return list(SKILLS.rglob("SKILL.md")) if SKILLS.is_dir() else []
+
+
+def _live_knowledge_files() -> list[Path]:
+    return [_kt.topic_path(slug) for slug, _text, _files in _kt.iter_topics()]
+
+
+def _split_fm_body(path: Path) -> tuple[dict, str]:
+    """Lightweight frontmatter parse (same hand-rolled shape as
+    hooks/knowledge-inject.py's `_parse_frontmatter` — kept independent since
+    this file has no import path to the hook)."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {}, ""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}, text
+    fm: dict = {}
+    for line in text[3:end].splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            fm[k.strip()] = v.strip().strip('"')
+    body = text[end + 4:].lstrip("\n")
+    return fm, body
+
+
+def _alias_tokens(fm: dict) -> set[str]:
+    m = re.search(r"\[(.*?)\]", fm.get("aliases", ""), re.S)
+    if not m:
+        return set()
+    toks: set[str] = set()
+    for part in m.group(1).split(","):
+        part = part.strip().strip('"').strip("'")
+        toks |= {w for w in _WORD_RE.findall(part.lower()) if len(w) > 2}
+    return toks
+
+
+def _distinctive_tokens(text: str) -> set[str]:
+    return {
+        w for w in _WORD_RE.findall(text.lower())
+        if len(w) > 3 and w not in _OVERLAP_STOPWORDS
+    }
+
+
+def _paragraphs(body: str) -> list[str]:
+    out: list[str] = []
+    for p in re.split(r"\n\s*\n", body):
+        p = " ".join(p.split())
+        if len(p) >= _PARA_MIN_CHARS:
+            out.append(p)
+    return out
+
+
+def _check_stale_cross_refs() -> list[Finding]:
+    # NOTE: file-existence check, NOT `_knowledge_slugs()` membership — that
+    # set is scoped to valid ## Related targets and deliberately excludes
+    # INBOX.md (a transient staging file, not a stable topic). A skill
+    # legitimately referencing `knowledge/INBOX.md` is not stale; only a
+    # reference to a knowledge file that isn't actually on disk is.
+    skill_slugs = _skill_slugs()
+    out: list[Finding] = []
+
+    for sf in _live_skill_files():
+        try:
+            lines = sf.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        for i, line in enumerate(lines, 1):
+            for m in _KNOW_REF_RE.finditer(line):
+                slug = m.group(1)
+                if (KNOW / f"{slug}.md").exists():
+                    continue
+                out.append(Finding(
+                    check="knowledge_skill_overlap",
+                    title=f"stale knowledge/{slug}.md reference in {sf.parent.name}",
+                    doc=f"{_rel(sf)}:{i}",
+                    claim=f"references knowledge/{slug}.md",
+                    actual="no such file in knowledge/",
+                    delta=f"stale cross-reference → knowledge/{slug}.md missing",
+                    confidence=MEDIUM,
+                    proposed_fix=None,
+                    why_unsure="target may have been renamed, merged, or deleted; a "
+                               "reviewer should repoint or drop the reference rather "
+                               "than have prose auto-edited.",
+                ))
+
+    for kf in _live_knowledge_files():
+        try:
+            lines = kf.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+        for i, line in enumerate(lines, 1):
+            for m in _SKILL_REF_RE.finditer(line):
+                slug = m.group(1).lower()
+                if slug in skill_slugs:
+                    continue
+                out.append(Finding(
+                    check="knowledge_skill_overlap",
+                    title=f"stale skill reference '{slug}' in {kf.stem}",
+                    doc=f"{_rel(kf)}:{i}",
+                    claim=f"references the '{slug}' skill",
+                    actual="no skill directory by that name exists",
+                    delta=f"stale cross-reference → skill '{slug}' missing",
+                    confidence=MEDIUM,
+                    proposed_fix=None,
+                    why_unsure="target may have been renamed, merged, or disabled "
+                               "(SKILL.md.disabled); a reviewer should repoint or "
+                               "drop the reference.",
+                ))
+    return out
+
+
+def _check_alias_overlap() -> list[Finding]:
+    skills: list[tuple[str, set[str]]] = []
+    for sf in _live_skill_files():
+        fm, _ = _split_fm_body(sf)
+        name = (fm.get("name") or sf.parent.name).lower()
+        toks = {w for w in _WORD_RE.findall(name) if len(w) > 2}
+        toks |= _distinctive_tokens(fm.get("description", ""))
+        skills.append((name, toks))
+
+    out: list[Finding] = []
+    for kf in _live_knowledge_files():
+        fm, _ = _split_fm_body(kf)
+        slug = kf.stem.lower()
+        k_toks = _alias_tokens(fm) | {w for w in _WORD_RE.findall(slug) if len(w) > 2}
+        if len(k_toks) < _ALIAS_MIN_SHARED:
+            continue
+        for sname, s_toks in skills:
+            if not s_toks or slug == sname:
+                continue
+            inter = k_toks & s_toks
+            if len(inter) < _ALIAS_MIN_SHARED:
+                continue
+            union = k_toks | s_toks
+            score = len(inter) / len(union)
+            if score < _ALIAS_OVERLAP_THRESHOLD:
+                continue
+            out.append(Finding(
+                check="knowledge_skill_overlap",
+                title=f"'{slug}' knowledge topic overlaps '{sname}' skill",
+                doc=_rel(kf),
+                claim=f"topic tokens: {sorted(k_toks)[:8]}",
+                actual=f"skill '{sname}' tokens: {sorted(s_toks)[:8]}",
+                delta=f"{score:.0%} shared distinctive tokens: {sorted(inter)[:6]}",
+                confidence=LOW,
+                proposed_fix=None,
+                why_unsure="shared vocabulary is a signal, not proof of duplicated "
+                           "content — a reviewer must read both files before "
+                           "merging or cross-linking them.",
+            ))
+    return out
+
+
+def _check_paragraph_overlap() -> list[Finding]:
+    know_paras: list[tuple[str, str]] = []
+    for kf in _live_knowledge_files():
+        _, body = _split_fm_body(kf)
+        know_paras.extend((kf.stem, p) for p in _paragraphs(body))
+
+    out: list[Finding] = []
+    seen: set[tuple[str, str]] = set()
+    for sf in _live_skill_files():
+        _, body = _split_fm_body(sf)
+        sname = sf.parent.name
+        for sp in _paragraphs(body):
+            for kslug, kp in know_paras:
+                # Cheap length prefilter before the O(n*m) SequenceMatcher call.
+                if abs(len(sp) - len(kp)) > 0.3 * max(len(sp), len(kp)):
+                    continue
+                ratio = difflib.SequenceMatcher(None, sp, kp).ratio()
+                if ratio < _PARA_SIMILARITY_THRESHOLD:
+                    continue
+                key = (kslug, sname)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(Finding(
+                    check="knowledge_skill_overlap",
+                    title=f"near-duplicate paragraph: '{kslug}' knowledge vs '{sname}' skill",
+                    doc=f"{kslug}.md",
+                    claim=kp[:100] + ("…" if len(kp) > 100 else ""),
+                    actual=sp[:100] + ("…" if len(sp) > 100 else ""),
+                    delta=f"{ratio:.0%} text similarity",
+                    confidence=LOW,
+                    proposed_fix=None,
+                    why_unsure="near-identical prose on both sides; a reviewer decides "
+                               "which is canonical and whether the other should be "
+                               "trimmed to a pointer instead.",
+                ))
+    return out
+
+
+def check_knowledge_skill_overlap() -> list[Finding]:
+    """Cross-boundary overlap between knowledge/ facts and skills/ procedures
+    (Phase 3 core of the knowledge-skill-pipeline plan). Always UNSURE — see
+    the section docstring above for why none of these three sub-checks can
+    safely auto-fix:
+      1. stale cross-reference (knowledge/X.md or skills/.../SKILL.md named
+         but no longer exists, either direction)
+      2. shared-alias / near-duplicate-slug overlap between a knowledge topic
+         and a skill's name+description
+      3. near-duplicate paragraph content on both sides
+    """
+    return (
+        _check_stale_cross_refs()
+        + _check_alias_overlap()
+        + _check_paragraph_overlap()
+    )
+
+
+CHECKS: list[Callable[[], list[Finding]]] = [
+    check_plugin_count,
+    check_cron_topology,
+    check_cron_schedules,
+    check_skill_counts,
+    check_nudge_intervals,
+    check_stale_related_links,
+    check_tool_name_references,
+    check_knowledge_skill_overlap,
+]
+
+
+# --------------------------------------------------------------------------- #
+# Report writing
+# --------------------------------------------------------------------------- #
+def _render_item(f: Finding) -> str:
+    lines = [
+        f"### {f.title}",
+        f"- check: `{f.check}`",
+        f"- doc: `{f.doc}`",
+        f"- claim: {f.claim}",
+        f"- actual: {f.actual}",
+        f"- delta: {f.delta}",
+    ]
+    if f.proposed_fix is not None:
+        lines.append("- proposed_fix:")
+        lines.append("  ```diff")
+        for pl in f.proposed_fix.splitlines():
+            lines.append(f"  {pl}")
+        lines.append("  ```")
+    else:
+        lines.append("- proposed_fix: None")
+    if f.why_unsure:
+        lines.append(f"- why_unsure: {f.why_unsure}")
+    return "\n".join(lines)
+
+
+def _archive_previous(today_report: Path) -> None:
+    """Move any existing drift-*.md (other than today's) into .archive/.
+    Today's own file is left to be overwritten so re-runs are idempotent."""
+    REPORT_ARCHIVE.mkdir(parents=True, exist_ok=True)
+    for old in SYSTEM.glob("drift-*.md"):
+        if old.name == today_report.name:
+            continue
+        shutil.move(str(old), str(REPORT_ARCHIVE / old.name))
+
+
+def write_report(fixable: list[Finding], unsure: list[Finding]) -> Path:
+    SYSTEM.mkdir(parents=True, exist_ok=True)
+    today = date.today().isoformat()
+    report = SYSTEM / f"drift-{today}.md"
+    _archive_previous(report)
+
+    parts = [
+        f"# Doc Drift Check · {today}",
+        "",
+        f"_{len(fixable)} fixable, {len(unsure)} unsure. "
+        "Phase 1 is report-only — no doc was modified._",
+        "",
+        "## FIXABLE",
+        "",
+        "_High confidence: actual value is uniquely defined and the doc has a "
+        "specific token to swap. Each carries a proposed surgical fix._",
+        "",
+    ]
+    if fixable:
+        parts.append("\n\n".join(_render_item(f) for f in fixable))
+    else:
+        parts.append("_(none)_")
+    parts += [
+        "",
+        "## UNSURE",
+        "",
+        "_Medium/low confidence: value is clear but the doc's intent is "
+        "ambiguous (derived, approximate, or possibly historical). "
+        "`proposed_fix` is None; a reviewer decides._",
+        "",
+    ]
+    if unsure:
+        parts.append("\n\n".join(_render_item(f) for f in unsure))
+    else:
+        parts.append("_(none)_")
+    parts.append("")
+    report.write_text("\n".join(parts), encoding="utf-8")
+    return report
+
+
+def main() -> int:
+    fixable: list[Finding] = []
+    unsure: list[Finding] = []
+    for check in CHECKS:
+        for f in check():
+            (fixable if f.confidence == HIGH else unsure).append(f)
+
+    write_report(fixable, unsure)
+
+    n_fix, n_uns = len(fixable), len(unsure)
+    if n_fix or n_uns:
+        print(f"drift: {n_fix} fixable, {n_uns} unsure")
+    else:
+        print("drift: clean")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

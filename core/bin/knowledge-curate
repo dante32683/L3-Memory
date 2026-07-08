@@ -1,0 +1,897 @@
+#!/usr/bin/env python3
+"""knowledge-curate — autonomous INBOX → knowledge curation (v3 §4, mimo-driven).
+
+The janitor that makes the knowledge base self-maintaining. Run nightly (cron).
+mimo does ALL the judgment; the script only does safe file I/O. Steps:
+
+  1. Read append-only INBOX.md captured lines.
+  2. ROUTE (one mimo call): each line -> merge into an existing topic, create a
+     NEW topic (with slug + aliases), or drop as noise.
+  3. INTEGRATE (one mimo call per touched existing topic): rewrite the file body
+     deduped, with superseded facts dropped, kept UNDER budget. This folds
+     dedupe + staleness-prune + cap-and-compress into a single automatic pass —
+     so knowledge files can never grow without bound.
+  4. NEW topics are auto-created (additive, reversible) and listed in the report.
+  5. Consumed INBOX is archived to INBOX.archive.md and INBOX.md is reset.
+     Pre-curation file versions are archived to knowledge/.archive/.
+
+SAFETY: if any model call fails, the run ABORTS without consuming INBOX — capture
+is never lost. The report (stdout) is what a notify step can surface to Telegram.
+
+Zero manual management by design: the only thing ever asked of the user is to
+glance at the report of newly-created topics.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from aux_model import ask_json, ask  # noqa: E402
+import related_links  # noqa: E402  # deterministic ## Related block protect/populate
+import knowledge_topics as kt  # noqa: E402  # single source of truth for topic layout
+
+HERMES_HOME = Path(os.environ.get("L3_HOME", os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))))
+KNOW = HERMES_HOME / "knowledge"
+SKILLS = HERMES_HOME / "skills"
+INBOX = KNOW / ".system" / "INBOX.md"
+INBOX_ARCHIVE = KNOW / ".system" / "INBOX.archive.md"
+FILE_ARCHIVE = KNOW / ".archive"
+FILE_BUDGET = int(os.environ.get("HERMES_KNOW_FILE_BUDGET", "20000"))
+# Curation is low-frequency (nightly) but QUALITY-critical (it rewrites
+# knowledge base bodies, dedupes, decides which facts to keep). Set
+# HERMES_CURATE_MODEL to your highest-quality model; falls back to
+# L3_AUX_MODEL if unset. Override the provider label via HERMES_CURATE_PROVIDER.
+CURATE_PROVIDER = os.environ.get("HERMES_CURATE_PROVIDER", "default")
+CURATE_MODEL = os.environ.get("HERMES_CURATE_MODEL", "")
+# ROUTING is plain classification (line -> merge/new/skill_patch/.../noise),
+# not a rewrite — it doesn't need the same reasoning depth as a full rewrite,
+# and with a reasoning model that depth is exactly what makes it slow (measured
+# live 2026-07-06 at 83s-300s+ on the SAME prompt — a reasoning model's
+# variance, not prompt size). Point ROUTE_MODEL at a faster/non-reasoning model
+# for this pure classification pass, and reserve CURATE_MODEL for _integrate's
+# quality-critical full-body rewrites, per the note below.
+ROUTE_MODEL = os.environ.get("HERMES_CURATE_ROUTE_MODEL", "")
+# The pro model is a reasoning model: a full-body rewrite of the largest topic
+# files routinely runs ~50s and can exceed the aux_model default (120s) under
+# load. A single timed-out integrate call aborts the WHOLE nightly run (it is
+# abort-safe, so INBOX is preserved and the next run recovers — but the run is
+# wasted). Give these low-frequency, quality-critical calls plenty of headroom.
+CURATE_CALL_TIMEOUT = int(os.environ.get("HERMES_CURATE_CALL_TIMEOUT", "300"))
+
+_SLUG_RE = re.compile(r"[^a-z0-9-]")
+
+# Aliases are matched as IDENTITY tokens by the knowledge-inject hook: if an alias
+# is a common word, every unrelated message containing it triggers a false-positive
+# injection. So generic words must never be authored as aliases.
+#
+# SINGLE SOURCE OF TRUTH: knowledge/.system/generic-blocklist.txt — the SAME file
+# the inject hook reads, so the writer (here) and the reader (knowledge-inject.py)
+# can never drift. The file holds singular/stem forms; we stem each candidate word
+# (via _gen_stem, mirroring the hook's _stem) before checking, so plural and
+# singular both collapse to the stored stem.
+_BLOCKLIST_FILE = KNOW / ".system" / "generic-blocklist.txt"
+
+
+def _load_generic() -> set:
+    try:
+        return {
+            ln.strip()
+            for ln in _BLOCKLIST_FILE.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")
+        }
+    except Exception:
+        return set()
+
+
+_GENERIC_ALIASES = _load_generic()
+
+
+def _skill_dirnames() -> set:
+    """Every skill's directory name — these are RESERVED identity tokens
+    ([[skill-name]] links resolve to a skill via that exact alias, see the
+    SKILL.md frontmatter backfill). A knowledge topic must never also claim one
+    as a generic alias, or [[skill-name]] becomes ambiguous between the skill
+    and an unrelated knowledge note (this is exactly how '[[pdf]]' silently
+    resolved to the wrong file before this check existed)."""
+    if not SKILLS.is_dir():
+        return set()
+    return {p.parent.name.lower() for p in SKILLS.rglob("SKILL.md")}
+
+
+_SKILL_DIRNAMES = _skill_dirnames()
+
+
+def _gen_stem(w: str) -> str:
+    """Singular/plural normalizer — mirror of knowledge-inject.py:_stem so the
+    blocklist (stored as stems) matches the same words on both sides."""
+    if len(w) < 4:
+        return w
+    if w.endswith("ies"):
+        return w[:-3] + "y"
+    if w.endswith(("ses", "xes", "zes", "ches", "shes")):
+        return w[:-2]
+    if w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
+def _filter_aliases(aliases: list[str]) -> list[str]:
+    """Drop generic/common-word aliases and dups; keep distinctive single words.
+
+    The inject hook matches identity tokens against individual whitespace-split
+    words from the message (knowledge-inject.py:_tokens), so an alias only ever
+    matches if it is itself a single word. A multi-word phrase like
+    "minimax m3 reasoning" must therefore be split into its component words —
+    gluing it into "minimaxm3reasoning" produces a token nothing will match.
+    We split on whitespace/punctuation and filter each resulting word."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for a in aliases:
+        for w in re.split(r"[^a-z0-9]+", str(a).strip().lower()):
+            if (len(w) < 3 or _gen_stem(w) in _GENERIC_ALIASES
+                    or w in _SKILL_DIRNAMES or w in seen):
+                continue
+            seen.add(w)
+            out.append(w)
+    return out
+
+
+def _drop_slug_echo(aliases: list[str], slug: str) -> list[str]:
+    """Drop aliases that merely restate the slug (e.g. slug 'ref-provider-rates'
+    → alias 'refproviderrates'). The slug is already an identity token on its own,
+    so such glued echoes add nothing and are exactly the kind of thing the user
+    would never type."""
+    glued = slug.replace("-", "").replace("_", "")
+    return [a for a in aliases if a != glued]
+
+
+def _slugify(s: str) -> str:
+    return _SLUG_RE.sub("", s.lower().strip().replace(" ", "-").replace("_", "-"))[:40] or "misc"
+
+
+def _split_frontmatter(text: str):
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            return text[:end + 4], text[end + 4:].lstrip("\n")
+    return "", text
+
+
+def _extract_aliases(fm: str) -> list[str]:
+    m = re.search(r"^aliases:\s*\[(.*?)\]", fm, re.M)
+    if not m:
+        return []
+    return [a.strip().strip("\"'").lower() for a in m.group(1).split(",") if a.strip()]
+
+
+def _set_fm_aliases(fm: str, aliases: list[str]) -> str:
+    """Rewrite (or insert) the aliases line in a frontmatter block that still
+    carries its --- delimiters. Returns fm unchanged if it has no frontmatter."""
+    if not fm.strip():
+        return fm
+    line = f"aliases: [{', '.join(aliases)}]"
+    if re.search(r"^aliases:.*$", fm, re.M):
+        return re.sub(r"^aliases:.*$", line, fm, count=1, flags=re.M)
+    # No aliases line yet — insert just before the closing '---'.
+    return re.sub(r"\n---\s*$", f"\n{line}\n---", fm, count=1)
+
+
+def _set_fm_use_when(fm: str, phrase: str) -> str:
+    """Rewrite (or insert) the `use_when:` line — the one-line 'read when' note
+    the toc-mode knowledge injector shows for this topic. Inserted right after
+    `title:` for readability; falls back to before the closing '---'. Value is
+    hard-capped at 80 chars (the injector's per-entry cap) and double-quoted so
+    a stray colon can't break the YAML."""
+    if not fm.strip() or not phrase.strip():
+        return fm
+    phrase = phrase.strip().strip("\"'").replace('"', "'")[:80]
+    line = f'use_when: "{phrase}"'
+    if re.search(r"^use_when:.*$", fm, re.M):
+        return re.sub(r"^use_when:.*$", lambda m: line, fm, count=1, flags=re.M)
+    if re.search(r"^title:.*$", fm, re.M):
+        return re.sub(r"^title:.*$", lambda m: m.group(0) + "\n" + line, fm, count=1, flags=re.M)
+    return re.sub(r"\n---\s*$", lambda m: "\n" + line + m.group(0), fm, count=1)
+
+
+def _topic_path(slug: str) -> Path:
+    """The body file for a topic — always <slug>/<slug>.md (every topic is a
+    folder; see bin/knowledge_topics.py). Callers create it on first write."""
+    return kt.topic_path(slug)
+
+
+def _topic_index() -> list[dict]:
+    return [kt.topic_meta(slug, text) for slug, text, _files in kt.iter_topics()]
+
+
+def _captured_lines() -> list[str]:
+    if not INBOX.exists():
+        return []
+    out = []
+    for line in INBOX.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^- (.+)$", line.strip())
+        if m and not m.group(1).startswith("…(+"):
+            out.append(m.group(1).strip())
+    return out
+
+
+def _route(lines: list[str], topics: list[dict], skills: list[dict] | None = None):
+    topic_list = "\n".join(f"- {t['slug']}: {t['title']} (aliases: {t['aliases']})" for t in topics)
+    skills = skills or []
+    skill_list = "\n".join(f"- {s['name']}: {s['desc']}" for s in skills) or "(none)"
+    numbered = "\n".join(f"[{i}] {ln}" for i, ln in enumerate(lines))
+    prompt = f"""You maintain a personal assistant's knowledge base for the user.
+Existing knowledge topic files (FACTS):
+{topic_list}
+
+Existing skills (PROCEDURES / how-tos):
+{skill_list}
+
+Below are captured lines from chat sessions (things the user typed, or facts/
+techniques the assistant discovered mid-task) — judge both by the same
+FACT-vs-PROCEDURE test; assistant-discovered is not more fact-like.
+
+Classify FACT vs PROCEDURE FIRST — a hard boundary. Knowledge holds ONLY
+durable facts (a person/system/account/rate/project's current STATE), NEVER
+instructions. A PROCEDURE is anything telling a future reader HOW to do a
+task: steps, checklist, "how to set up X", workflow, gotcha/fix, dev
+convention, setup recipe, or a skill/doc AUTHORING convention (route the
+latter to `hermes-agent-skill-authoring` via skill_patch, never as a fact).
+If it reads like an instruction to FOLLOW rather than a fact to LOOK UP, it's
+a PROCEDURE — regardless of whether a skill already covers it.
+
+Also "noise" any raw INSTANCE SNAPSHOT COUNT ("N plugins/skills as of today"
+style tallies) even though it looks fact-shaped — goes stale instantly and
+`doc-drift-check` already tracks these numbers deterministically.
+
+For EACH line, decide:
+- "merge": the line states/implies a durable FACT belonging to an existing topic. Give the topic slug and a clean one-sentence fact.
+- "new": it is a durable fact about a topic that does NOT exist yet. Give a short kebab-case slug, a Title, 4-8 lowercase aliases, a "use_when" trigger phrase (MAX 80 chars: when a future request should pull this file, e.g. "SMART train schedules" — no quotes, no trailing period), and the clean fact. Aliases auto-match this topic against future messages, so they MUST be REAL WORDS the user would actually type. Hard rules:
+  * Write each alias as the user would say it. For a multi-word concept emit the separate words ("opencode", "go", "pricing") or a space-separated phrase ("opencode go pricing") — NEVER glue them into one token like "opencodegopricing" or "minimaxm3reasoning", which matches nothing.
+  * NO generic/common words that show up in unrelated requests (tool, list, file, info, data, status, config, update, report, api, system, access, today, event, home, time, model, open, mode, service, cost, page, table, etc.).
+  * NEVER the user's personal name — it tags almost every message and can't select a topic.
+  * NO slug-echoes — don't restate the slug as an alias (slug "ref-provider-rates" → never "refproviderrates"); the slug already matches.
+  * NO ultra-specific identifiers (internal codes, file paths, document names) the user would never type casually.
+  * Prefer first names over full names, common terms alongside jargon.
+- "skill_patch": the line is a PROCEDURE and an EXISTING skill from the list above already clearly covers this class of task. Give the skill "name" (EXACTLY one from the skills list above) and the clean instruction as "fact".
+- "skill_new": the line is a PROCEDURE and NO existing skill covers it. Propose a brand-new class-level skill. Give:
+  * "name": kebab-case, lowercase letters/digits/hyphens only, starting with a letter or digit. Must name the CLASS of task, generalized beyond this one instance — e.g. "database-migrations", not "fix-prod-db-2026-07-05". NEVER a session artifact: no PR/issue numbers, error strings, dates, or "fix-X/debug-Y/audit-Z-today" phrasing. If you can't state the name without referencing today's specific task, this line isn't skill_new material — reconsider merge/skill_patch, or use noise if it's truly one-off.
+  * "title": short human title.
+  * "description": ONE sentence (<160 chars) describing when this skill applies — this drives future triggering, so phrase it as a trigger condition, not a summary.
+  * "fact": the clean procedural step/instruction to seed the skill body with.
+  A PROCEDURE line NEVER falls back to "merge" or "new" just because no skill fits yet — that is exactly how procedures leak into the knowledge base. skill_new exists so that fallback is never necessary. Only use "noise" for a procedure if it is a one-off, non-reusable action (e.g. "restarted the gateway because it hung" — not a repeatable technique).
+- "noise": a transient question, chit-chat, or no durable fact/reusable procedure. Drop it.
+
+Lines:
+{numbered}
+
+Return ONLY a JSON array, one object per line index:
+[{{"i":0,"action":"merge","slug":"prius","fact":"..."}},
+ {{"i":1,"action":"new","slug":"...","title":"...","aliases":["..."],"use_when":"...","fact":"..."}},
+ {{"i":2,"action":"skill_patch","name":"docx","fact":"..."}},
+ {{"i":3,"action":"skill_new","name":"...","title":"...","description":"...","fact":"..."}},
+ {{"i":4,"action":"noise"}}]"""
+    # retries=1: aux_model.ask()'s default (4 retries at the SAME timeout) means
+    # one genuinely slow call can silently burn up to ~4x CURATE_CALL_TIMEOUT
+    # before raising — enough alone to blow through cron's fixed outer
+    # script_timeout_seconds (720s, config.yaml) with no report and INBOX only
+    # preserved by luck of the SIGKILL. Retrying a slow model at an identical
+    # timeout rarely helps (it's not a flaky-connection retry, it's the same
+    # endpoint under the same load); bounding to one attempt keeps a single
+    # call's worst case at CURATE_CALL_TIMEOUT, not a multiple of it.
+    return ask_json(prompt, default=None, temperature=0.1, timeout=CURATE_CALL_TIMEOUT, retries=1, provider=CURATE_PROVIDER, model=ROUTE_MODEL)
+
+
+# Routing in BATCHES so a large INBOX (now fed by discovery-extract too) can't
+# overflow the model's output and truncate/hallucinate the JSON. Each batch is
+# routed independently; the per-line index `i` is local to the batch (main()
+# keys off slug/action/fact, not `i`, so no global offset is needed). ABORT-SAFE:
+# if ANY batch fails we return None and the caller preserves the whole INBOX.
+ROUTE_BATCH = int(os.environ.get("HERMES_CURATE_BATCH", "40"))
+
+
+def _route_all(lines: list[str], topics: list[dict], skills: list[dict] | None = None):
+    """Route every batch CONCURRENTLY (was sequential) — with the reasoning
+    model each batch call can take close to CURATE_CALL_TIMEOUT (300s), and
+    the whole run sits under a fixed outer cron script_timeout_seconds (720s,
+    see config.yaml). Sequential batches could add up past that ceiling and
+    get hard-killed mid-run (SIGKILL, no report, INBOX preserved but the tick
+    wasted) — this happened 2026-07-06. Batches are independent (each carries
+    its own local `i`; main() keys off slug/action/fact, never a global
+    offset) so fanning them out is safe, same pattern as _process_merge below."""
+    batches = [lines[start:start + ROUTE_BATCH] for start in range(0, len(lines), ROUTE_BATCH)]
+    if not batches:
+        return []
+    max_workers = int(os.environ.get("HERMES_CURATE_WORKERS", "4"))
+    print(f"[route] {len(batches)} batch(es), {max_workers} worker(s)...", file=sys.stderr, flush=True)
+    t0 = datetime.now()
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as ex:
+        results = list(ex.map(lambda b: _route(b, topics, skills), batches))
+    print(f"[route] all batches done in {(datetime.now() - t0).total_seconds():.1f}s", file=sys.stderr, flush=True)
+    decisions: list = []
+    for out in results:
+        if not isinstance(out, list):
+            return None
+        decisions.extend(out)
+    return decisions
+
+
+_ALIAS_SENTINEL = "===ALIASES==="
+_USE_WHEN_SENTINEL = "===USE_WHEN==="
+_RELATED_SENTINEL = "===RELATED==="
+
+
+def _integrate(slug: str, body: str, new_facts: list[str],
+               known_slugs: frozenset = frozenset()) -> tuple[str, list[str], str, list[str]] | None:
+    """ONE model call that consolidates the file, refreshes its aliases + use_when,
+    and suggests cross-links. Returns (revised_body, aliases, use_when,
+    related_slugs) or None on failure.
+
+    ## Related PROTECTION: the trailing `## Related` block is peeled off with
+    related_links.split_related() BEFORE the body is sent to the model (the model
+    never sees it, so it can't mangle/drop it) and re-attached verbatim after. Any
+    cross-links the model suggests are then applied MECHANICALLY via
+    related_links.add_link() (deduped, validated against real topics) — never by
+    trusting the model to write the block itself.
+
+    Body + aliases + use_when + related are separated by sentinel lines rather
+    than JSON, so a large markdown body can't break parsing."""
+    # Peel the protected Related block off before the model sees the body.
+    body, related_block = related_links.split_related(body)
+    facts = "\n".join(f"- {f}" for f in new_facts)
+    slug_glued = slug.replace("-", "").replace("_", "")
+    other_slugs = sorted(s for s in known_slugs if s.lower() != slug.lower())
+    slug_menu = ", ".join(other_slugs) if other_slugs else "(none)"
+    prompt = f"""You maintain the knowledge file for topic "{slug}" in a personal assistant.
+Here is the current file body (markdown, no frontmatter):
+<<<CURRENT
+{body}
+CURRENT
+
+New facts to fold in:
+{facts}
+
+Do BOTH of the following, in order:
+
+1. Rewrite the COMPLETE updated body in markdown. Requirements:
+- Integrate the new facts in the right sections (keep the heading structure).
+- PRESERVE existing useful detail — do NOT summarise away history that is still valid.
+- DEDUPLICATE: never repeat a fact.
+- Drop facts clearly SUPERSEDED by newer ones (e.g. an old balance replaced by a new one).
+- ONLY IF the result would exceed {FILE_BUDGET} characters, trim the least-important
+  older detail to fit under {FILE_BUDGET}. Otherwise keep everything.
+- Do NOT write a "## Related" section or any [[wikilinks]] — cross-links are
+  handled separately (step 4) and re-attached automatically; anything you write
+  there is discarded.
+- No commentary, no code fence.
+
+2. On a final line, output 4-10 lowercase keyword aliases covering the topic's
+CURRENT content, so it stays findable as it grows new sub-subjects. Each alias
+must be a REAL WORD the user would actually type. Hard rules:
+- For a multi-word concept, write the words SEPARATELY ("oracle", "cloud") or as a
+  space-separated phrase ("oracle cloud") — NEVER glue them into one token like
+  "oraclecloudsetup" or "knowledgefilelocation", which matches nothing.
+- NEVER generic fillers (tool, list, file, info, data, status, config, update,
+  report, api, system, access, today, event, home, time, model, open, mode,
+  service, cost, page, table).
+- NEVER the user's personal name — it tags nearly every message.
+- NEVER a slug-echo (e.g. for topic "{slug}" do not emit "{slug_glued}"); the slug
+  already matches on its own.
+- NEVER ultra-specific identifiers the user would never type casually (internal
+  codes, file paths, document names).
+Prefer first names over full names. Singular form.
+
+3. On a final line, output a single "use_when" trigger phrase (MAX 80 chars):
+a short description of WHEN a future request should pull this file, phrased as
+the topic/condition (NOT starting with "read when"). E.g. for a transit file:
+"SMART train / Sonoma-Marin transit schedules"; for a server file: "this box's
+runtime env: docker, zsh, python, node". One line, no quotes, no trailing period.
+
+4. On a final line, output up to 3 slugs of OTHER existing topics that this file
+directly references or closely complements (cross-reference links), comma-separated,
+or the single word "none". Choose ONLY from this exact list of existing slugs:
+{slug_menu}
+Pick a slug ONLY if the relationship is genuine — prefer "none" over a weak guess.
+Never list "{slug}" itself, and never invent a slug not in the list above.
+
+Output EXACTLY this structure and NOTHING else:
+<the full markdown body>
+{_ALIAS_SENTINEL}
+alias1, alias2, alias3, ...
+{_USE_WHEN_SENTINEL}
+<the one-line use_when phrase>
+{_RELATED_SENTINEL}
+slug-a, slug-b"""
+    try:
+        # retries=1 — see the matching note on the _route() call above: a slow
+        # reasoning-model rewrite retried at the same timeout just multiplies
+        # the worst case instead of recovering anything.
+        out = ask(prompt, temperature=0.2, timeout=CURATE_CALL_TIMEOUT, retries=1, provider=CURATE_PROVIDER, model=CURATE_MODEL)
+    except Exception as e:
+        print(f"  integrate call failed ({type(e).__name__}): {e}", file=sys.stderr)
+        return None
+    if not out:
+        return None
+    # Parse from the END: output order is body, ALIASES, aliases, USE_WHEN, phrase,
+    # RELATED, slugs — so pop RELATED first, then USE_WHEN, then ALIASES.
+    related_suggested: list[str] = []
+    if _RELATED_SENTINEL in out:
+        out, rel_part = out.rsplit(_RELATED_SENTINEL, 1)
+        related_suggested = [s.strip() for s in re.split(r"[,\n]", rel_part)
+                             if s.strip() and s.strip().lower() != "none"]
+    use_when = ""
+    if _USE_WHEN_SENTINEL in out:
+        out, uw_part = out.rsplit(_USE_WHEN_SENTINEL, 1)
+        uw_lines = [ln.strip() for ln in uw_part.strip().splitlines() if ln.strip()]
+        use_when = uw_lines[0] if uw_lines else ""
+    aliases: list[str] = []
+    if _ALIAS_SENTINEL in out:
+        out, alias_part = out.rsplit(_ALIAS_SENTINEL, 1)
+        aliases = _filter_aliases([a for a in alias_part.replace("\n", ",").split(",")])
+    out = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", out.strip(), flags=re.M).strip()
+    if not out:
+        return None
+    # PROTECTION: discard any Related block the model wrote despite instructions,
+    # then re-attach the ORIGINAL block it never saw, and apply newly-suggested
+    # cross-links mechanically (deduped, real slugs only).
+    out, _model_related = related_links.split_related(out)
+    out = related_links.join_related(out, related_block)
+    known_lower = {s.lower(): s for s in known_slugs}
+    applied: list[str] = []
+    for s in related_suggested:
+        key = s.strip().strip("[]").lower()
+        if key == slug.lower() or key not in known_lower:
+            continue
+        out, changed = related_links.add_link(out, known_lower[key])
+        if changed:
+            applied.append(known_lower[key])
+    return out, aliases, use_when, applied
+
+
+def _all_topic_files() -> dict[str, Path]:
+    """slug -> path for every live topic. Mirrors _topic_index()'s discovery."""
+    return {slug: kt.topic_path(slug) for slug, _text, _files in kt.iter_topics()}
+
+
+def _reconcile_backlinks() -> int:
+    """Make every ## Related link reciprocal: if A links [[B]] but B lacks [[A]],
+    add [[A]] to B. Additive + idempotent, pure stdlib. Only links whose target is
+    a real existing topic are reciprocated (dangling links are left for
+    doc-drift-check to flag, not silently materialised). Returns links added."""
+    files = _all_topic_files()
+    known = {slug.lower(): slug for slug in files}
+    # Snapshot every file's forward links first, so we reason over a stable graph.
+    fwd: dict[str, list[str]] = {}
+    for slug, path in files.items():
+        _, rel = related_links.split_related(_split_frontmatter(path.read_text(encoding="utf-8"))[1])
+        fwd[slug] = related_links.related_targets(rel)
+    added = 0
+    for slug, targets in list(fwd.items()):
+        for t in targets:
+            tgt = known.get(t.lower())
+            if not tgt or tgt == slug:
+                continue
+            if slug.lower() in {x.lower() for x in fwd.get(tgt, [])}:
+                continue  # reciprocal link already present
+            path = files[tgt]
+            fm, body = _split_frontmatter(path.read_text(encoding="utf-8"))
+            new_body, changed = related_links.add_link(body, slug)
+            if changed:
+                path.write_text((fm + "\n\n" if fm else "") + new_body.rstrip("\n") + "\n",
+                                encoding="utf-8")
+                fwd.setdefault(tgt, []).append(slug)
+                added += 1
+    return added
+
+
+# --------------------------------------------------------------------------- #
+# skill_patch / skill_new routes (Phase 4 + procedure-creation extension):
+# procedural INBOX lines -> an existing skill's SKILL.md (skill_patch) or a
+# brand-new class-level skill (skill_new) — NEVER a knowledge fact file. Skill
+# frontmatter (name/description that drive triggering) is PRESERVED verbatim
+# on patch — only the body is rewritten, and the `## Related` block is
+# protected + populated exactly as for knowledge topics.
+#
+# PROTECTED SKILLS: bundled (shipped with Hermes) and hub-installed skills are
+# never a target for skill_patch (excluded from the router's menu AND
+# double-checked at write time) and never collide-block a skill_new creation
+# in a way that silently overwrites them — mirrors tools/skill_usage's
+# is_agent_created() off-limits set (same two source files), because the
+# native background_review fork enforces the identical "protected skills:
+# do not edit" rule and curation must not diverge from it.
+# --------------------------------------------------------------------------- #
+def _protected_skill_names() -> set[str]:
+    """Bundled + hub-installed skill names — off-limits to curation writes.
+
+    Reads the SAME two source files tools/skill_usage.py's
+    _read_bundled_manifest_names()/_read_hub_installed_names() read
+    (skills/.bundled_manifest, skills/.hub/lock.json), so this script's
+    notion of "protected" can never drift from the native background_review/
+    curator's. Missing/unreadable files -> empty (fail open, not closed —
+    same as upstream)."""
+    names: set[str] = set()
+    manifest = SKILLS / ".bundled_manifest"
+    if manifest.exists():
+        try:
+            for line in manifest.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line:
+                    names.add(line.split(":", 1)[0].strip())
+        except Exception:
+            pass
+    lock = SKILLS / ".hub" / "lock.json"
+    if lock.exists():
+        try:
+            data = json.loads(lock.read_text(encoding="utf-8"))
+            installed = data.get("installed") or {}
+            if isinstance(installed, dict):
+                names.update(str(k) for k in installed.keys())
+        except Exception:
+            pass
+    return names
+
+
+def _all_skill_names() -> set[str]:
+    """Every skill name on disk regardless of protected status — used ONLY for
+    skill_new collision detection (a new skill must never shadow ANY existing
+    name, protected or not), never for the router's menu."""
+    if not SKILLS.is_dir():
+        return set()
+    return {p.parent.name for p in SKILLS.rglob("SKILL.md") if not p.parent.name.startswith(".")}
+
+
+_VALID_SKILL_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
+
+
+def _skill_path(name: str) -> Path | None:
+    """skills/<name>/SKILL.md (nested-collection aware). None if absent. The
+    `## Related` block lives in the ROOT SKILL.md only (plan RESOLVED 2026-07-02)."""
+    direct = SKILLS / name / "SKILL.md"
+    if direct.exists():
+        return direct
+    if not SKILLS.is_dir():
+        return None
+    return next((p for p in SKILLS.rglob("SKILL.md") if p.parent.name == name), None)
+
+
+def _skill_index() -> list[dict]:
+    """[{name, desc}] for every NON-PROTECTED skill, for the router menu.
+    desc = frontmatter description first line (capped) so the whole menu
+    stays compact. Bundled/hub-installed skills are excluded — see the
+    protected-skills note above _skill_path()."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    if not SKILLS.is_dir():
+        return out
+    protected = _protected_skill_names()
+    for skill_md in sorted(SKILLS.rglob("SKILL.md")):
+        name = skill_md.parent.name
+        if name in seen or name in protected:
+            continue
+        seen.add(name)
+        try:
+            text = skill_md.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        m = re.search(r'^description:\s*"?(.+?)"?\s*$', text, re.M)
+        desc = (m.group(1).strip().strip('"') if m else "")[:90]
+        out.append({"name": name, "desc": desc})
+    return out
+
+
+def _integrate_skill(name: str, body: str, new_facts: list[str]) -> str | None:
+    """ONE model call that folds procedural notes into a skill's SKILL.md BODY.
+    Returns revised_body or None on failure.
+
+    Mirrors _integrate's structure but is skill-shaped: it does NOT author
+    aliases/use_when (knowledge-only concepts). Skills carry NO `## Related`
+    cross-link section — Obsidian's wikilink resolver only ever matches a
+    link against a real filename, never frontmatter `aliases:` (see
+    [[hermes-knowledge]]), and every skill's file is literally named
+    `SKILL.md`, so a `[[skill-name]]` link can never resolve. Any pre-existing
+    `## Related` block on a skill is stripped (peeled, never re-attached) the
+    first time this function touches that skill."""
+    body, _related_block = related_links.split_related(body)
+    facts = "\n".join(f"- {f}" for f in new_facts)
+    prompt = f"""You maintain the instructional SKILL.md body for the skill "{name}" in a
+personal assistant. Here is the current body (markdown, no frontmatter):
+<<<CURRENT
+{body}
+CURRENT
+
+New procedural notes / how-to steps / gotchas to fold in:
+{facts}
+
+Rewrite the COMPLETE updated body in markdown. Requirements:
+- Integrate the new procedural notes into the right sections (keep the heading structure and the skill's instructional voice).
+- PRESERVE existing useful instructions — do NOT summarise away steps that are still valid.
+- DEDUPLICATE: never repeat an instruction.
+- Drop steps clearly SUPERSEDED by newer ones.
+- ONLY IF the result would exceed {FILE_BUDGET} characters, trim the least-important older detail. Otherwise keep everything.
+- Do NOT write a "## Related" section or any [[wikilinks]] — skills don't participate in the cross-link system; anything you write there is discarded.
+- No commentary, no code fence.
+
+Output ONLY the markdown body, nothing else."""
+    try:
+        # retries=1 — see the matching note on the _route() call above: a slow
+        # reasoning-model rewrite retried at the same timeout just multiplies
+        # the worst case instead of recovering anything.
+        out = ask(prompt, temperature=0.2, timeout=CURATE_CALL_TIMEOUT, retries=1, provider=CURATE_PROVIDER, model=CURATE_MODEL)
+    except Exception as e:
+        print(f"  skill integrate call failed ({type(e).__name__}): {e}", file=sys.stderr)
+        return None
+    if not out:
+        return None
+    out = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", out.strip(), flags=re.M).strip()
+    if not out:
+        return None
+    out, _model_related = related_links.split_related(out)
+    return out
+
+
+def main() -> int:
+    if not KNOW.is_dir():
+        print("no knowledge dir")
+        return 0
+    lines = _captured_lines()
+    if not lines:
+        print("INBOX empty — nothing to curate.")
+        return 0
+
+    topics = _topic_index()
+    skills_idx = _skill_index()
+    skill_names = {s["name"] for s in skills_idx}
+    decisions = _route_all(lines, topics, skills_idx)
+    if not isinstance(decisions, list):
+        print("ABORT: routing failed (mimo); INBOX preserved.", file=sys.stderr)
+        return 1
+
+    existing = {t["slug"] for t in topics}
+    merges: dict[str, list[str]] = {}
+    new_topics: dict[str, dict] = {}
+    skill_patches: dict[str, list[str]] = {}
+    skill_new: dict[str, dict] = {}
+    skill_unresolved: list[tuple[str, str]] = []   # (requested_name, fact)
+    noise = 0
+    for d in decisions:
+        if not isinstance(d, dict):
+            continue
+        action = d.get("action")
+        fact = (d.get("fact") or "").strip()
+        if action == "noise" or not fact:
+            noise += 1
+            continue
+        if action == "skill_patch":
+            sname = (d.get("name") or d.get("slug") or "").strip()
+            if sname in skill_names:
+                skill_patches.setdefault(sname, []).append(fact)
+            else:
+                # Never fabricate a skill; surface it and let the line rest in the
+                # INBOX archive for a manual call rather than mis-filing it as a fact.
+                skill_unresolved.append((sname or "?", fact))
+            continue
+        if action == "skill_new":
+            sname = _slugify(d.get("name") or d.get("slug") or "")
+            entry = skill_new.setdefault(sname, {
+                "title": d.get("title") or sname.replace("-", " ").title(),
+                "description": (d.get("description") or "").strip(),
+                "facts": [],
+            })
+            entry["facts"].append(fact)
+            continue
+        slug = _slugify(d.get("slug") or "")
+        if action == "merge" and slug in existing:
+            merges.setdefault(slug, []).append(fact)
+        elif action == "new" or slug not in existing:
+            t = new_topics.setdefault(slug, {
+                "title": d.get("title") or slug.replace("-", " ").title(),
+                "aliases": _filter_aliases(d.get("aliases") or []),
+                "use_when": (d.get("use_when") or "").strip(),
+                "facts": [],
+            })
+            t["facts"].append(fact)
+        else:
+            merges.setdefault(slug, []).append(fact)
+
+    report = [f"# Curation report · {datetime.now():%Y-%m-%d %H:%M}",
+              f"- captured lines: {len(lines)}  noise dropped: {noise}"]
+
+    FILE_ARCHIVE.mkdir(exist_ok=True)
+
+    # Integrate existing topics. Each touched file is an INDEPENDENT model call,
+    # so we fan them out across a thread pool (the calls are I/O-bound on the aux
+    # endpoint) — this is what keeps the nightly run inside the cron budget when
+    # many topics are touched. Abort-safe: we stage every rewrite and only commit
+    # after ALL succeed; any single failure preserves the whole INBOX.
+    def _process_merge(item):
+        slug, facts = item
+        t0 = datetime.now()
+        print(f"  [integrate] {slug}: starting ({len(facts)} fact(s))...", file=sys.stderr, flush=True)
+        path = _topic_path(slug)
+        fm, body = _split_frontmatter(path.read_text(encoding="utf-8"))
+        result = _integrate(slug, body, facts, known_slugs=frozenset(existing))
+        print(f"  [integrate] {slug}: done in {(datetime.now() - t0).total_seconds():.1f}s"
+              f" ({'ok' if result else 'FAILED'})", file=sys.stderr, flush=True)
+        if result is None:
+            return slug, None
+        revised, suggested, suggested_uw, related_note = result
+        # Refresh aliases so a topic that grew new sub-subjects stays findable.
+        # UNION with existing (never lose a working keyword); on model failure to
+        # emit aliases we keep the old ones untouched.
+        old_aliases = _extract_aliases(fm)
+        alias_note = None
+        if suggested:
+            merged_aliases = sorted(_drop_slug_echo(
+                sorted(set(old_aliases) | set(suggested)), slug))
+            if set(merged_aliases) != set(old_aliases):
+                fm = _set_fm_aliases(fm, merged_aliases)
+                alias_note = sorted(set(merged_aliases) - set(old_aliases))
+        # Refresh the use_when 'read when' note (toc-mode injector). Only when the
+        # model emitted one; on omission the existing use_when is preserved as-is.
+        if suggested_uw:
+            fm = _set_fm_use_when(fm, suggested_uw)
+        new_text = (fm + "\n\n" if fm else "") + revised.rstrip("\n") + "\n"
+        return slug, (path, new_text, len(facts), alias_note, related_note)
+
+    max_workers = int(os.environ.get("HERMES_CURATE_WORKERS", "4"))
+    staged: list[tuple[str, Path, str]] = []
+    # A single topic's integrate call can transiently fail/return malformed
+    # output (model flakiness — observed 2026-07-06 on an otherwise-healthy
+    # run) with no relation to timing. Previously ANY one failure aborted the
+    # WHOLE run, discarding every other topic that succeeded — needlessly
+    # harsh for an occasional single-item flake. Mirror the skill_patch
+    # pattern below: a failed topic is skipped and reported, never silently
+    # dropped (its raw lines are still archived to INBOX.archive.md at the end
+    # regardless, so nothing is lost — just not merged THIS run).
+    merge_unresolved: list[str] = []
+    if merges:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            results = list(ex.map(_process_merge, list(merges.items())))
+        for slug, outcome in results:
+            if outcome is None:
+                report.append(f"- ⚠️ integrate FAILED for {slug} — topic untouched, its fact(s) stay in the INBOX archive for a manual/next-run retry")
+                merge_unresolved.append(slug)
+                continue
+            path, new_text, n_facts, alias_note, related_note = outcome
+            staged.append((slug, path, new_text))
+            report.append(f"- merged {n_facts} fact(s) → {slug} ({len(new_text)} chars)")
+            if alias_note:
+                report.append(f"  ↳ aliases refreshed for {slug}: +{alias_note}")
+            if related_note:
+                report.append(f"  ↳ related links added to {slug}: +{related_note}")
+
+    # Commit staged existing-topic rewrites. Archive name is keyed on the SLUG
+    # (every topic lives at `<slug>/<slug>.md`, so stem == slug already, but
+    # keying on slug explicitly keeps this correct regardless).
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    for slug, path, new_text in staged:
+        shutil.copy2(path, FILE_ARCHIVE / f"{slug}.{stamp}.md")
+        path.write_text(new_text, encoding="utf-8")
+
+    # Create new topics
+    for slug, t in new_topics.items():
+        path = _topic_path(slug)
+        if path.exists():  # slug collision → treat as merge instead
+            fm, body = _split_frontmatter(path.read_text(encoding="utf-8"))
+            result = _integrate(slug, body, t["facts"], known_slugs=frozenset(existing))
+            revised = result[0] if result else body
+            if result and result[2]:            # refresh use_when if the model gave one
+                fm = _set_fm_use_when(fm, result[2])
+            path.write_text((fm + "\n\n" if fm else "") + revised.rstrip("\n") + "\n", encoding="utf-8")
+            continue
+        aliases = _drop_slug_echo(t["aliases"], slug) or [slug]
+        # use_when: model-authored (from routing) if present, else derived from title.
+        use_when = (t.get("use_when") or "").strip().strip("\"'").replace('"', "'")[:80] \
+            or t["title"]
+        fm = (f"---\ntitle: {t['title']}\nuse_when: \"{use_when}\"\n"
+              f"aliases: [{', '.join(aliases)}]\n"
+              f"source: auto-created by knowledge-curate\n---\n\n")
+        facts_md = "\n".join(f"- {f}" for f in t["facts"])
+        path.parent.mkdir(parents=True, exist_ok=True)   # every topic is a folder
+        kt.files_dir(slug).mkdir(exist_ok=True)
+        path.write_text(f"{fm}# {t['title']}\n\n## Facts\n{facts_md}\n", encoding="utf-8")
+        report.append(f"- 🆕 NEW topic: {slug} ({t['title']}) — aliases {aliases}")
+
+    # skill_new: resolve proposed NEW skills against the disk BEFORE the
+    # skill_patch loop runs, so a name collision's facts still flow through
+    # that single patch pass below rather than being silently lost. Collision
+    # is checked against EVERY skill on disk (protected or not) — a curator
+    # created skill_new NEVER overwrites an existing skill, agent-created or
+    # bundled/hub. A collision with a protected skill is reported unresolved
+    # (never patched); a collision with an agent-created skill is redirected
+    # into skill_patch (same disambiguation the router itself would have
+    # produced had it known the name already existed).
+    all_names_on_disk = _all_skill_names()
+    skill_new_final: dict[str, dict] = {}
+    for sname, t in skill_new.items():
+        if not sname:
+            skill_unresolved.extend(("?", f) for f in t["facts"])
+        elif sname in all_names_on_disk:
+            if sname in skill_names:
+                skill_patches.setdefault(sname, []).extend(t["facts"])
+            else:
+                skill_unresolved.extend((sname, f) for f in t["facts"])
+        elif not _VALID_SKILL_NAME_RE.match(sname) or len(sname) > 64:
+            skill_unresolved.extend((sname, f) for f in t["facts"])
+        else:
+            skill_new_final[sname] = t
+            all_names_on_disk.add(sname)  # guard a second skill_new this run reusing the name
+
+    # Create the new skills. Minimal SKILL.md — name/description are the only
+    # fields tools/skill_manager_tool.py's _validate_frontmatter() requires, so
+    # this file is valid input to the native skill tools from the moment it's
+    # written (e.g. background_review or a live session can patch it further
+    # the normal way). No security scan here (unlike the model-facing
+    # skill_manage tool) because content is INBOX facts distilled by the
+    # router, not arbitrary model-authored code/scripts.
+    for sname, t in skill_new_final.items():
+        desc = (t["description"] or t["title"])[:160].replace('"', "'").strip() or sname
+        skill_dir = SKILLS / sname
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        facts_md = "\n".join(f"- {f}" for f in t["facts"])
+        fm = (f"---\nname: {sname}\ndescription: \"{desc}\"\n"
+              f"source: auto-created by knowledge-curate\n---\n\n")
+        (skill_dir / "SKILL.md").write_text(
+            f"{fm}# {t['title']}\n\n## Steps\n{facts_md}\n", encoding="utf-8")
+        report.append(f"- 🆕 NEW skill: {sname} ({t['title']}) — {desc}")
+
+    # skill_patch: fold procedural notes into existing skills' SKILL.md bodies.
+    # Frontmatter (name/description → triggering) is preserved; body is rewritten.
+    # Skills carry NO ## Related section (see _integrate_skill docstring — a
+    # [[skill-name]] link can never resolve in Obsidian, so the cross-link system
+    # is knowledge-topic-only). Abort-safe per item (a failed integrate leaves that
+    # skill untouched and is reported), but a skill failure does NOT abort the
+    # whole run — the knowledge merges already committed.
+    for sname, facts in skill_patches.items():
+        spath = _skill_path(sname)
+        if not spath:
+            skill_unresolved.extend((sname, f) for f in facts)
+            continue
+        fm, body = _split_frontmatter(spath.read_text(encoding="utf-8"))
+        revised = _integrate_skill(sname, body, facts)
+        if revised is None:
+            report.append(f"- ⚠️ skill_patch FAILED for {sname} ({len(facts)} note(s)) — skill untouched, notes archived")
+            skill_unresolved.extend((sname, f) for f in facts)
+            continue
+        shutil.copy2(spath, FILE_ARCHIVE / f"skill-{sname}.{stamp}.md")
+        spath.write_text((fm + "\n\n" if fm else "") + revised.rstrip("\n") + "\n", encoding="utf-8")
+        report.append(f"- 🛠️ skill_patch {len(facts)} note(s) → {sname} ({len(revised)} chars)")
+    if skill_unresolved:
+        report.append(f"- ⚠️ {len(skill_unresolved)} skill_patch note(s) needed a skill that "
+                      "doesn't exist or failed — left in INBOX archive for a manual call:")
+        for reqname, fact in skill_unresolved[:10]:
+            report.append(f"    · [{reqname}] {fact[:100]}")
+
+    # Bidirectional cross-link reconcile: for every [[B]] in file A's Related
+    # block, ensure B's Related block carries [[A]]. Purely ADDITIVE + idempotent
+    # (never removes), so it is safe to run after the atomic merge commit — a
+    # failure here can't corrupt content and self-heals on the next run. Non-fatal.
+    try:
+        n_back = _reconcile_backlinks()
+        if n_back:
+            report.append(f"- 🔗 reciprocal ## Related links added: {n_back}")
+    except Exception as e:
+        report.append(f"- ⚠️ backlink reconcile skipped ({type(e).__name__}: {e})")
+
+    # Archive consumed INBOX, reset it (only reached if everything above succeeded)
+    consumed = INBOX.read_text(encoding="utf-8")
+    with INBOX_ARCHIVE.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n<!-- curated {datetime.now():%Y-%m-%d %H:%M} -->\n{consumed}")
+    INBOX.write_text(
+        "# INBOX — append-only capture\n\n"
+        "Raw user lines per session. Curated nightly by knowledge-curate.\n",
+        encoding="utf-8",
+    )
+
+    print("\n".join(report))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

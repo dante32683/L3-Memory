@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""discovery-extract — capture AGENT-gathered discoveries into the INBOX.
+
+The external twin of Hermes' built-in self-improvement loop
+(`_spawn_background_review` in hermes-agent/agent/turn_finalizer.py). We can't
+patch core, and that loop writes to the agent memory store anyway — not the
+Hermes knowledge/ base. So we replicate the pattern outside the agent: read the
+conversation snapshot from state.db and reflect on it with the aux model.
+
+WHY this exists: inbox-capture.py only records USER lines. When the assistant
+discovers durable facts on the user's behalf — `gh repo list`, Drive listings,
+curl/API output, config/endpoint dumps — and the user never pastes them back, they
+die with the session. This recovers them.
+
+FLOW (per session, idempotent via a per-session watermark):
+  1. Read this session's messages SINCE the last processed id (cache watermark).
+  2. CHEAP GATE: if the new window has no tool results at all, advance the
+     watermark and exit at zero token cost (pure-chat windows have nothing the
+     user-line capture didn't already get).
+  3. One aux_model call over the window → JSON array of durable discovery bullets
+     (specs, configs, URLs, IDs, inventories), WITH the context that gives them
+     meaning. Returns [] when nothing qualifies.
+  4. Dedup against current INBOX, append a `## ts · discovery · sid` block.
+  5. Advance the watermark.
+
+SAFETY: append-only (never rewrites INBOX); flock-guarded against overlap; any
+failure leaves the watermark unadvanced so nothing is silently lost. Observer:
+prints nothing on the happy path (a detached background process).
+
+Invoked two ways:
+  * `discovery-extract --session <id>`  (detached spawn from the reflect hook)
+  * session_id on stdin JSON            (on_session_end / on_session_finalize)
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from aux_model import ask_json  # noqa: E402
+import knowledge_topics as kt  # noqa: E402
+
+HERMES_HOME = Path(os.environ.get("L3_HOME", os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))))
+DB = HERMES_HOME / "state.db"
+INBOX = HERMES_HOME / "knowledge" / ".system" / "INBOX.md"
+WATERMARK = HERMES_HOME / "cache" / "discovery-watermark.json"
+LOCK = HERMES_HOME / "cache" / "discovery-extract.lock"
+JSON_PREFIX = "\x00json:"
+
+CURATE_PROVIDER = os.environ.get("HERMES_CURATE_PROVIDER", "default")
+# Cap the window we feed the model so a heavy tool-output burst can't blow up the
+# prompt. We keep the MOST RECENT chars when over budget.
+WINDOW_CHARS = int(os.environ.get("HERMES_DISCOVERY_WINDOW_CHARS", "24000"))
+PER_MSG_CHARS = int(os.environ.get("HERMES_DISCOVERY_PER_MSG_CHARS", "4000"))
+MAX_BULLETS = int(os.environ.get("HERMES_DISCOVERY_MAX_BULLETS", "10"))
+
+KNOW = HERMES_HOME / "knowledge"
+# Local semantic dedup: drop a candidate bullet if it is a near-duplicate of a
+# fact we ALREADY hold (in the knowledge base or pending in INBOX). This is what
+# stops the same reworded discovery (e.g. the Drive inventory) being re-captured
+# every session — the volume that was timing the nightly curate cron out. It runs
+# with a LOCAL static-embedding model (model2vec): zero API tokens, ~0.8s cold
+# start, fully offline. Benchmarked vs rapidfuzz on real INBOX dups: the dups are
+# reworded (lexically divergent), so embeddings separate dup-from-distinct far
+# better. cos≥0.60 caught the obvious dups with zero false-positives; anything
+# ambiguous is left for curate's router to resolve (never a silent novel-fact drop).
+DEDUP_COS = float(os.environ.get("HERMES_DISCOVERY_DEDUP_COS", "0.60"))
+DEDUP_MODEL = os.environ.get("HERMES_DISCOVERY_EMBED_MODEL", "minishlab/potion-retrieval-32M")
+
+
+# ── watermark ────────────────────────────────────────────────────────────────
+def _load_watermark() -> dict:
+    try:
+        return json.loads(WATERMARK.read_text())
+    except Exception:
+        return {}
+
+
+def _save_watermark(wm: dict) -> None:
+    try:
+        WATERMARK.parent.mkdir(parents=True, exist_ok=True)
+        # keep bounded: only the most-recent 500 sessions
+        items = sorted(wm.items(), key=lambda kv: kv[1])[-500:]
+        WATERMARK.write_text(json.dumps(dict(items)))
+    except Exception:
+        pass
+
+
+def _decode(content) -> str:
+    if isinstance(content, str) and content.startswith(JSON_PREFIX):
+        try:
+            parts = json.loads(content[len(JSON_PREFIX):])
+            if isinstance(parts, list):
+                return " ".join(
+                    p.get("text", "") for p in parts
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+        except Exception:
+            return ""
+    return content if isinstance(content, str) else ""
+
+
+def _new_messages(session_id: str, after_id: int):
+    if not DB.exists():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=2)
+    except Exception:
+        return []
+    try:
+        cur = conn.execute(
+            "SELECT id, role, content, tool_name FROM messages "
+            "WHERE session_id=? AND id>? AND active=1 ORDER BY id",
+            (session_id, after_id),
+        )
+        return cur.fetchall()
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def _build_window(rows) -> str:
+    """Render the new messages into a compact transcript for the reflector.
+    Assistant text + tool RESULTS (the gathered data) are what matter; user lines
+    are already captured by inbox-capture, so we keep them only as light context."""
+    chunks: list[str] = []
+    for _id, role, content, tool_name in rows:
+        text = _decode(content).strip()
+        if not text:
+            continue
+        text = text[:PER_MSG_CHARS]
+        if role == "tool":
+            chunks.append(f"[tool:{tool_name or '?'}]\n{text}")
+        elif role == "assistant":
+            chunks.append(f"[assistant]\n{text}")
+        elif role == "user":
+            chunks.append(f"[user] {text[:300]}")
+    window = "\n\n".join(chunks)
+    if len(window) > WINDOW_CHARS:          # keep the most recent
+        window = window[-WINDOW_CHARS:]
+    return window
+
+
+_NORM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _norm(s: str) -> str:
+    return _NORM_RE.sub(" ", s.lower()).strip()
+
+
+def _inbox_norms() -> set:
+    if not INBOX.exists():
+        return set()
+    out = set()
+    for line in INBOX.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^- (.+)$", line.strip())
+        if m:
+            out.add(_norm(m.group(1)))
+    return out
+
+
+def _known_corpus() -> list[str]:
+    """Every fact we already hold: bullet lines from the knowledge base
+    (every topic is a folder <slug>/<slug>.md) plus the current INBOX. These
+    are what a new candidate must be DISTINCT from to be worth capturing."""
+    facts: list[str] = []
+    if not KNOW.is_dir():
+        return facts
+    paths = [kt.topic_path(slug) for slug, _text, _files in kt.iter_topics()]
+    paths.append(INBOX)
+    for p in paths:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            m = re.match(r"^- (.+)$", line.strip())
+            if m and not m.group(1).startswith("…(+"):
+                facts.append(m.group(1).strip())
+    return facts
+
+
+def _user_turns_full(rows) -> list[str]:
+    """Full (untruncated) user text from the window. discovery-extract is meant
+    to capture facts the ASSISTANT gathered that the user did NOT type — but when a
+    long user message overflows inbox-capture's cap, the assistant often restates
+    it, and the reflector can't tell that restatement from a real gathered fact,
+    so it can launder the user's own words into a 'discovery' with fabricated
+    provenance. Feeding these full user turns into the dedup corpus makes any such
+    restatement score as a near-duplicate of what the user said and get dropped."""
+    out: list[str] = []
+    for _id, role, content, _tool in rows:
+        if role == "user":
+            text = _decode(content).strip()
+            if text:
+                out.append(text)
+    return out
+
+
+def _semantic_filter(bullets: list[str], corpus: list[str]) -> list[str]:
+    """Return only the bullets NOT already represented in `corpus`, using local
+    static embeddings (model2vec). Graceful: any failure (model missing, etc.)
+    returns the bullets unchanged so capture is never blocked by the dedup layer.
+    The exact-norm pass in the caller already handles verbatim repeats, so this
+    only needs to fire for the harder reworded near-duplicates."""
+    if not bullets or not corpus:
+        return bullets
+    try:
+        from model2vec import StaticModel
+        import numpy as np
+    except Exception:
+        return bullets
+    try:
+        model = StaticModel.from_pretrained(DEDUP_MODEL)
+        cand = model.encode(bullets)
+        base = model.encode(corpus)
+        cand = cand / (np.linalg.norm(cand, axis=1, keepdims=True) + 1e-9)
+        base = base / (np.linalg.norm(base, axis=1, keepdims=True) + 1e-9)
+        sims = cand @ base.T               # (n_bullets, n_corpus) cosine matrix
+        keep_mask = sims.max(axis=1) < DEDUP_COS
+    except Exception:
+        return bullets
+    return [b for b, keep in zip(bullets, keep_mask) if keep]
+
+
+def _extract(window: str) -> list[str]:
+    prompt = f"""You watch a personal assistant ("Hermes") working for a user.
+Below is a slice of a session: assistant messages and the RESULTS of tools it ran
+(web searches, shell/`gh`/`curl` output, Drive listings, config dumps, API reads).
+
+Your job: pull out facts the assistant GATHERED that the user did NOT type themselves
+(so they would otherwise be lost) AND that pass this ONE test:
+
+  Will this fact still be TRUE and USEFUL a month from now, in a DIFFERENT session?
+
+Only emit a bullet if the answer is clearly yes. This covers durable facts about
+the user's world (accounts, projects, environment) AND durable operational knowledge
+the agent needs to do future work (e.g. "use python3 not python on this box",
+"the pptx skill replaces the deprecated powerpoint one", verified specs/versions,
+working configs/commands, endpoints, stable resource inventories, IDs).
+
+For EACH fact, write ONE self-contained bullet that INCLUDES the context that
+gives it meaning (don't write a bare list — say what it IS). E.g. not "repo-x,
+repo-y" but "the user's GitHub repos (via gh): repo-x, repo-y, …".
+
+HARD DROP — these FAIL the month-from-now test, never emit them:
+- In-progress, single-task state: file paths under work/scratch dirs, "build/save
+  X to Y" instructions, the contents/styling internals of a doc being edited right
+  now, a file's last-modified date, intermediate results of THIS task.
+- Transient command output: ls, git status, restarts, diffs, one-off errors and
+  their fixes ("python not found" → that's noise, not a durable fact).
+- Chit-chat, and anything specific to only this session.
+
+Session slice:
+<<<
+{window}
+>>>
+
+Return ONLY a JSON array of bullet strings (max {MAX_BULLETS}). If nothing
+qualifies, return []."""
+    out = ask_json(prompt, default=None, temperature=0.1, provider=CURATE_PROVIDER)
+    if not isinstance(out, list):
+        return []
+    bullets = []
+    for b in out:
+        b = str(b).strip().lstrip("-• ").strip()
+        if b:
+            bullets.append(b[:400])
+    return bullets[:MAX_BULLETS]
+
+
+def _resolve_session_id() -> str:
+    argv = sys.argv[1:]
+    if "--session" in argv:
+        i = argv.index("--session")
+        if i + 1 < len(argv):
+            return argv[i + 1].strip()
+    # else read from stdin JSON (hook invocation)
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return ""
+    extra = payload.get("extra") or {}
+    return str(payload.get("session_id") or extra.get("session_id") or "").strip()
+
+
+def main() -> int:
+    session_id = _resolve_session_id()
+    if not session_id:
+        return 0
+
+    # Single-flight: if another extract is mid-run, skip (we'll catch up next time).
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import fcntl
+        lockf = open(LOCK, "w")
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        return 0
+
+    try:
+        wm = _load_watermark()
+        after_id = int(wm.get(session_id, 0))
+        rows = _new_messages(session_id, after_id)
+        if not rows:
+            return 0
+        max_id = max(r[0] for r in rows)
+
+        # CHEAP GATE: no tool results in the new window → nothing was gathered.
+        if not any(r[1] == "tool" for r in rows):
+            wm[session_id] = max_id
+            _save_watermark(wm)
+            return 0
+
+        window = _build_window(rows)
+        if not window.strip():
+            wm[session_id] = max_id
+            _save_watermark(wm)
+            return 0
+
+        bullets = _extract(window)
+        # Advance the watermark only AFTER a successful model pass (ask_json
+        # swallows errors and returns [] — but [] here means "model said nothing
+        # durable", which is a valid, final answer for this window).
+        if not bullets:
+            wm[session_id] = max_id
+            _save_watermark(wm)
+            return 0
+
+        # Dedup in two passes: (1) cheap exact-norm against the current INBOX
+        # kills verbatim repeats; (2) local semantic embedding against the whole
+        # known corpus (knowledge base + INBOX) kills reworded re-discoveries —
+        # the volume driver. Both are zero-API-token, fully local.
+        existing = _inbox_norms()
+        fresh = [b for b in bullets if _norm(b) not in existing]
+        # Corpus = everything we already hold PLUS this window's own full user
+        # turns, so a bullet that merely restates what the user typed is dropped
+        # (can't be laundered into a mislabeled "gathered fact").
+        fresh = _semantic_filter(fresh, _known_corpus() + _user_turns_full(rows))
+        if not fresh:
+            wm[session_id] = max_id
+            _save_watermark(wm)
+            return 0
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        block = [f"\n## {ts} · discovery · {session_id}"]
+        block += [f"- {b}" for b in fresh]
+
+        INBOX.parent.mkdir(parents=True, exist_ok=True)
+        if not INBOX.exists():
+            INBOX.write_text(
+                "# INBOX — append-only capture\n\n"
+                "Raw user lines + assistant discoveries per session. Curated by "
+                "knowledge-curate.\n",
+                encoding="utf-8",
+            )
+        with INBOX.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(block) + "\n")
+
+        wm[session_id] = max_id
+        _save_watermark(wm)
+        return 0
+    finally:
+        try:
+            lockf.close()
+        except Exception:
+            pass
+
+
+def _detach_self(session_id: str) -> None:
+    """Re-spawn this script detached (--session <id>) and return immediately.
+
+    The on_session_end/on_session_finalize shell-hook entries run this script
+    with a 10s timeout, but a real extraction window needs an aux-model call
+    (often >10s) — so the hook invocation was being SIGKILLed at 10.01s
+    (574 warnings in errors.log between 2026-06-23 and 2026-07-02). The
+    watermark discipline meant nothing was lost, but the work was killed and
+    endlessly retried. Detaching matches what hooks/discovery-reflect.py
+    already does for its mid-session spawns: the hook process exits in
+    milliseconds, the child does the full pipeline with no timeout, and the
+    flock single-flight in main() still prevents overlap.
+    """
+    import subprocess
+
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--session", session_id],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    # Hook invocation (no --session argv → session id arrives on stdin JSON):
+    # hand off to a detached copy of ourselves and exit before the shell-hook
+    # timeout can kill the model call. Set HERMES_DISCOVERY_INLINE=1 to force
+    # the old inline behaviour (debugging).
+    if "--session" not in sys.argv[1:] and os.environ.get("HERMES_DISCOVERY_INLINE") != "1":
+        sid = _resolve_session_id()  # consumes stdin
+        if sid:
+            _detach_self(sid)
+        raise SystemExit(0)
+    raise SystemExit(main())
