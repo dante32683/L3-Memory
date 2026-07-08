@@ -34,6 +34,12 @@ INBOX = HERMES_HOME / "knowledge" / ".system" / "INBOX.md"
 SEEN = HERMES_HOME / "cache" / "inbox-captured.json"
 JSON_PREFIX = "\x00json:"
 
+sys.path.insert(0, str(HERMES_HOME / "bin"))
+try:
+    import inbox_meta
+except Exception:
+    inbox_meta = None
+
 # Skip trivial/noise user lines so INBOX stays signal.
 _SKIP_RE = re.compile(r"^\s*(/\w+|hi|hey|hello|thanks?|thank you|ok|okay|yes|no|yep|nope)\s*$", re.I)
 MAX_LINES = 12          # cap per session block
@@ -127,11 +133,13 @@ def main() -> int:
 
     platform = str(extra.get("platform") or payload.get("platform") or "cli")
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    captured = lines[:MAX_LINES]
+    omitted = max(len(lines) - MAX_LINES, 0)
     block = [f"\n## {ts} · {platform} · {session_id}"]
-    for ln in lines[:MAX_LINES]:
+    for ln in captured:
         block.append(f"- {ln}")
-    if len(lines) > MAX_LINES:
-        block.append(f"- …(+{len(lines) - MAX_LINES} more)")
+    if omitted:
+        block.append(f"- …(+{omitted} more)")
 
     INBOX.parent.mkdir(parents=True, exist_ok=True)
     if not INBOX.exists():
@@ -143,6 +151,23 @@ def main() -> int:
         )
     with INBOX.open("a", encoding="utf-8") as fh:
         fh.write("\n".join(block) + "\n")
+    if inbox_meta:
+        try:
+            inbox_meta.append_records(
+                INBOX,
+                block_id=inbox_meta.block_id(ts, "inbox-capture", session_id),
+                timestamp=ts,
+                source="inbox-capture",
+                source_class="user_direct",
+                trust="user",
+                session_id=session_id,
+                platform=platform,
+                lines=captured,
+                max_lines=MAX_LINES,
+                omitted_lines=omitted,
+            )
+        except Exception:
+            pass
 
     seen.add(session_id)
     _save_seen(seen)

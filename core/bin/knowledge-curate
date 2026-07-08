@@ -36,12 +36,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aux_model import ask_json, ask  # noqa: E402
 import related_links  # noqa: E402  # deterministic ## Related block protect/populate
 import knowledge_topics as kt  # noqa: E402  # single source of truth for topic layout
+from inbox_meta import line_hash  # noqa: E402
 
 HERMES_HOME = Path(os.environ.get("L3_HOME", os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))))
 KNOW = HERMES_HOME / "knowledge"
 SKILLS = HERMES_HOME / "skills"
 INBOX = KNOW / ".system" / "INBOX.md"
+INBOX_META = KNOW / ".system" / "INBOX.meta.jsonl"
 INBOX_ARCHIVE = KNOW / ".system" / "INBOX.archive.md"
+INBOX_REVIEW = KNOW / ".system" / "INBOX.review.md"
 FILE_ARCHIVE = KNOW / ".archive"
 FILE_BUDGET = int(os.environ.get("HERMES_KNOW_FILE_BUDGET", "20000"))
 # Curation is low-frequency (nightly) but QUALITY-critical (it rewrites
@@ -219,6 +222,86 @@ def _captured_lines() -> list[str]:
         if m and not m.group(1).startswith("…(+"):
             out.append(m.group(1).strip())
     return out
+
+
+def _load_inbox_meta() -> dict[str, dict]:
+    if not INBOX_META.exists():
+        return {}
+    out: dict[str, dict] = {}
+    try:
+        for raw in INBOX_META.read_text(encoding="utf-8").splitlines():
+            if not raw.strip():
+                continue
+            try:
+                rec = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            h = rec.get("line_hash")
+            if isinstance(h, str) and h:
+                out[h] = rec
+    except Exception:
+        return {}
+    return out
+
+
+def _promotion_decision(meta: dict | None) -> tuple[bool, str]:
+    """Return (allow_auto_promotion, reason) for one captured INBOX line."""
+    if not meta:
+        return False, "missing_provenance"
+
+    explicit = str(meta.get("promotion_policy") or "").strip().lower()
+    if explicit in {"deny", "quarantine", "review"}:
+        return False, f"policy_{explicit}"
+    if explicit == "allow":
+        return True, "policy_allow"
+
+    source_class = str(meta.get("source_class") or "").strip().lower()
+    trust = str(meta.get("trust") or meta.get("confidence") or "").strip().lower()
+
+    if trust in {"user_confirmed", "verified"}:
+        return True, f"{source_class or 'unknown'}:{trust}"
+    if source_class in {"user_direct", "repo_local", "system_config"}:
+        return True, f"{source_class}:{trust or 'recorded'}"
+    if source_class in {"agent_gathered", "agent_observed"}:
+        if meta.get("source"):
+            return True, f"{source_class}:{trust or 'sourced'}"
+        return False, f"{source_class}_without_source"
+    if source_class == "tool_result":
+        if trust in {"observed", "local_deterministic"} or meta.get("deterministic") is True:
+            return True, f"{source_class}:{trust or 'deterministic'}"
+        return False, f"{source_class}_unverified"
+    if source_class == "agent_inferred":
+        return False, "agent_inferred_review"
+    if source_class == "web_untrusted":
+        return False, "web_untrusted_quarantine"
+    return False, f"unknown_source_class:{source_class or 'missing'}"
+
+
+def _apply_provenance_policy(lines: list[str]) -> tuple[list[str], list[dict]]:
+    meta_by_hash = _load_inbox_meta()
+    allowed: list[str] = []
+    blocked: list[dict] = []
+    for text in lines:
+        meta = meta_by_hash.get(line_hash(text))
+        allowed_line, reason = _promotion_decision(meta)
+        if allowed_line:
+            allowed.append(text)
+        else:
+            blocked.append({"line": text, "reason": reason, "meta": meta})
+    return allowed, blocked
+
+
+def _append_review_lines(blocked: list[dict]) -> None:
+    if not blocked:
+        return
+    INBOX_REVIEW.parent.mkdir(parents=True, exist_ok=True)
+    with INBOX_REVIEW.open("a", encoding="utf-8") as fh:
+        fh.write(f"\n<!-- provenance review {datetime.now():%Y-%m-%d %H:%M} -->\n")
+        for item in blocked:
+            meta = item.get("meta") or {}
+            source_class = meta.get("source_class") or "unknown"
+            trust = meta.get("trust") or meta.get("confidence") or "unknown"
+            fh.write(f"- [{item['reason']}; source_class={source_class}; trust={trust}] {item['line']}\n")
 
 
 def _route(lines: list[str], topics: list[dict], skills: list[dict] | None = None):
@@ -643,11 +726,27 @@ def main() -> int:
     if not lines:
         print("INBOX empty — nothing to curate.")
         return 0
+    promotable_lines, provenance_blocked = _apply_provenance_policy(lines)
+    if not promotable_lines and provenance_blocked:
+        _append_review_lines(provenance_blocked)
+        consumed = INBOX.read_text(encoding="utf-8")
+        with INBOX_ARCHIVE.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n<!-- curated {datetime.now():%Y-%m-%d %H:%M}; provenance-blocked -->\n{consumed}")
+        INBOX.write_text(
+            "# INBOX — append-only capture\n\n"
+            "Raw user lines per session. Curated nightly by knowledge-curate.\n",
+            encoding="utf-8",
+        )
+        print(f"# Curation report · {datetime.now():%Y-%m-%d %H:%M}")
+        print(f"- captured lines: {len(lines)}")
+        print(f"- provenance blocked: {len(provenance_blocked)} — moved to {INBOX_REVIEW}")
+        print("- no lines were auto-promoted")
+        return 0
 
     topics = _topic_index()
     skills_idx = _skill_index()
     skill_names = {s["name"] for s in skills_idx}
-    decisions = _route_all(lines, topics, skills_idx)
+    decisions = _route_all(promotable_lines, topics, skills_idx)
     if not isinstance(decisions, list):
         print("ABORT: routing failed (aux model); INBOX preserved.", file=sys.stderr)
         return 1
@@ -700,7 +799,10 @@ def main() -> int:
             merges.setdefault(slug, []).append(fact)
 
     report = [f"# Curation report · {datetime.now():%Y-%m-%d %H:%M}",
-              f"- captured lines: {len(lines)}  noise dropped: {noise}"]
+              f"- captured lines: {len(lines)}  promotable: {len(promotable_lines)}  "
+              f"provenance blocked: {len(provenance_blocked)}  noise dropped: {noise}"]
+    if provenance_blocked:
+        report.append(f"- provenance-blocked lines moved to {INBOX_REVIEW}")
 
     FILE_ARCHIVE.mkdir(exist_ok=True)
 
@@ -880,6 +982,7 @@ def main() -> int:
         report.append(f"- ⚠️ backlink reconcile skipped ({type(e).__name__}: {e})")
 
     # Archive consumed INBOX, reset it (only reached if everything above succeeded)
+    _append_review_lines(provenance_blocked)
     consumed = INBOX.read_text(encoding="utf-8")
     with INBOX_ARCHIVE.open("a", encoding="utf-8") as fh:
         fh.write(f"\n<!-- curated {datetime.now():%Y-%m-%d %H:%M} -->\n{consumed}")

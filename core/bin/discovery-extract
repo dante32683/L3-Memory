@@ -43,6 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from aux_model import ask_json  # noqa: E402
+import inbox_meta  # noqa: E402
 import knowledge_topics as kt  # noqa: E402
 
 HERMES_HOME = Path(os.environ.get("L3_HOME", os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))))
@@ -362,6 +363,22 @@ def main() -> int:
             )
         with INBOX.open("a", encoding="utf-8") as fh:
             fh.write("\n".join(block) + "\n")
+        try:
+            inbox_meta.append_records(
+                INBOX,
+                block_id=inbox_meta.block_id(ts, "discovery-extract", session_id),
+                timestamp=ts,
+                source="discovery-extract",
+                source_class="agent_gathered",
+                trust="model_extracted",
+                session_id=session_id,
+                platform="discovery",
+                lines=fresh,
+                max_lines=MAX_BULLETS,
+                omitted_lines=max(len(bullets) - len(fresh), 0),
+            )
+        except Exception:
+            pass
 
         wm[session_id] = max_id
         _save_watermark(wm)

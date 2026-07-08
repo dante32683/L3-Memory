@@ -122,6 +122,10 @@ def _inject_mod():
 def _recall_tokens(text: str) -> set[str]:
     inj = _inject_mod()
     out: set[str] = set()
+    for w in re.findall(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)+", text.lower()):
+        norm = w.replace("_", "-")
+        if len(norm) >= 3:
+            out.add(norm)
     for w in re.findall(r"[a-z][a-z0-9]{2,}", text.lower()):
         if w in inj._STOP:
             continue

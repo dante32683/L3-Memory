@@ -113,6 +113,13 @@ def _stem(w: str) -> str:
 
 def _tokens(text: str) -> set[str]:
     out: set[str] = set()
+    # Preserve exact compound identifiers before splitting words. A slug like
+    # "hermes-gate" may be made only of generic parts, but the exact compound is
+    # still a strong topic identity.
+    for w in re.findall(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)+", text.lower()):
+        norm = w.replace("_", "-")
+        if len(norm) >= 3:
+            out.add(norm)
     for w in re.findall(r"[a-z][a-z0-9]{2,}", text.lower()):
         if w in _STOP:
             continue

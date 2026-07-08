@@ -21,7 +21,8 @@ L3-Memory/ (GitHub Repo Root)
 │   │   ├── doc-drift-check # Audits documented claims against OS realities
 │   │   ├── drift-apply     # Deterministically auto-applies fixable doc drift
 │   │   ├── hermes-add      # Enforces resource count budgets (skills/crons/hooks)
-│   │   ├── knowledge-curate # Curation janitor (INBOX -> topic folders)
+│   │   ├── inbox_meta.py   # JSONL provenance sidecar writer for INBOX entries
+│   │   ├── knowledge-curate # Trust-gated curation janitor (INBOX -> topics/skills)
 │   │   ├── knowledge_topics.py # Layout configuration source of truth
 │   │   ├── md_sections.py  # Markdown parsing helper for targeted heading reads
 │   │   ├── related_links.py # Double-entry related backlinks reconciler
@@ -35,6 +36,9 @@ L3-Memory/ (GitHub Repo Root)
 │   └── scripts/            # Cron wrappers
 │       ├── doc-drift-check-cron.py
 │       └── knowledge-curate-nightly.py
+│
+├── eval/                   # Regression harnesses
+│   └── current_system_eval.py # 36-query retrieval/TOC eval against live Hermes code
 │
 └── integrations/           # Platform-specific integrations
     └── hermes/
@@ -71,11 +75,40 @@ This project ships with no vendor default — you must point it at a real OpenAI
 Captured lines from user chat messages and tool outputs are staged in:
 `$L3_HOME/knowledge/.system/INBOX.md`
 
+New captures also write machine-readable provenance records to:
+`$L3_HOME/knowledge/.system/INBOX.meta.jsonl`
+
+The Markdown INBOX remains the human-readable queue; the JSONL sidecar records source, trust class, session/platform, block id, and line hash for later curation/audit policy.
+
 ### 2. Nightly Curation
 Automated curation updates, deduplicates, and files inbox details into topic wikis and skill directories.
 
+Before routing any line to the model, `knowledge-curate` reads `INBOX.meta.jsonl`
+by `line_hash` and applies the promotion policy:
+
+* Allowed by default: `user_direct`, `repo_local`, `system_config`, sourced
+  `agent_gathered` / `agent_observed`, verified/user-confirmed records,
+  deterministic local tool results, or explicit `promotion_policy=allow`.
+* Held for review: missing provenance, `agent_inferred`, unverified
+  `tool_result`, `web_untrusted`, or explicit `review` / `quarantine` / `deny`.
+
+Held lines are appended to:
+`$L3_HOME/knowledge/.system/INBOX.review.md`
+
+This keeps untrusted or inferred content from becoming durable memory just
+because it appeared in the capture queue.
+
 ### 3. Verification & Self-Healing
 Audits system topology against assertions in documentation, automatically applying deterministic code changes for drifted values.
+
+### 4. Retrieval Regression
+Run the live-path retrieval harness after scoring/tokenization changes:
+
+```bash
+python3 eval/current_system_eval.py --hermes-home ~/.hermes
+```
+
+The harness imports the installed Hermes hook/plugin code and reports search top-1/top-3/found/MRR plus TOC shown/dropped/no-match counts.
 
 ---
 
